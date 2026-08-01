@@ -1,0 +1,20 @@
+DPDK_25 {
+	global:
+
+	rte_ub_ring_alloc_buf;
+	rte_ub_ring_free_buf;
+	rte_ub_ring_fini;
+	rte_ub_ring_get_data_buf_area;
+	rte_ub_ring_get_data_elt_size;
+	rte_ub_ring_get_node_index;
+	rte_ub_ring_get_peer_index;
+	rte_ub_ring_get_queue_mapping;
+	rte_ub_ring_get_total_queues;
+	rte_ub_ring_provider_init;
+	rte_ub_ring_queue_to_provider;
+	rte_ub_ring_recv_burst;
+	rte_ub_ring_send_burst;
+	rte_ub_ring_user_init;
+
+	local: *;
+};

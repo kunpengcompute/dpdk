@@ -1,485 +1,497 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  *
- * rte_eth_ub_ring PMD — vdev 驱动, 运行时通过 -d librte_net_ub_ring.so 加载
+ * ub_ring ethdev PMD (Layer 3) — mbuf adapter over lib/ub_ring (Layer 2).
  */
 
 #include <stdlib.h>
+#include <string.h>
+
 #include <rte_eal.h>
+#include <rte_log.h>
+#include <rte_malloc.h>
+#include <rte_errno.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_ring.h>
 #include <rte_ethdev.h>
-#include <rte_malloc.h>
-#include <rte_kvargs.h>
-#include <rte_errno.h>
-#include <rte_log.h>
-#include <bus_vdev_driver.h>
 #include <ethdev_driver.h>
 
-/* ---- 日志 ---- */
-RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, NOTICE);
-#define RTE_LOGTYPE_UB_RING ub_ring_logtype
-#define UB_RING_LOG(level, ...) \
-    RTE_LOG_LINE_PREFIX(level, UB_RING, "%s(): ", __func__, __VA_ARGS__)
+#include <rte_ub_ring.h>
+#include <rte_eth_ub_ring.h>
 
-/* ---- 固定参数 ---- */
-#define RING_COUNT    1024
-#define NB_MBUFS      512
-#define POOL_CACHE    32
+RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, NOTICE);
+#define RTE_LOGTYPE_UB_RING_ETH ub_ring_eth_logtype
+#define UB_RING_ETH_LOG(level, ...) \
+	RTE_LOG_LINE_PREFIX(level, UB_RING_ETH, "%s(): ", __func__, __VA_ARGS__)
 
-/* ---- vdev 参数 key ---- */
-#define UB_RING_ARG_RX       "rx"
-#define UB_RING_ARG_TX       "tx"
-#define UB_RING_ARG_POOL     "pool"
-#define UB_RING_ARG_POOL_SZ  "pool_sz"
-#define UB_RING_ARG_BASE     "base"
+#define UB_RING_ETH_MAX_BURST 128
 
-/* ---- 数据结构 ---- */
+/* ---- internals ---- */
 
-struct ub_ring_internals;
+struct ub_ring_eth_internals;
 
-struct ub_ring_queue {
-    struct rte_ring          *rng;
-    struct ub_ring_internals *internals;
+struct ub_ring_eth_queue {
+	uint32_t queue_id;
+	uint32_t provider_index;  /* which provider shm this queue maps to */
+	struct ub_ring_eth_internals *internals;
 };
 
-struct ub_ring_internals {
-    void               *ubsmem_base;
-    struct rte_mempool *pool;
-    unsigned int        max_rx_queues;
-    unsigned int        max_tx_queues;
+struct ub_ring_eth_internals {
+	struct ub_ring_eth_queue rx_queues[RTE_MAX_QUEUES_PER_PORT];
+	struct ub_ring_eth_queue tx_queues[RTE_MAX_QUEUES_PER_PORT];
 
-    struct ub_ring_queue rx_queues[RTE_MAX_QUEUES_PER_PORT];
-    struct ub_ring_queue tx_queues[RTE_MAX_QUEUES_PER_PORT];
+	/* dummy pools: one per provider, backed by data ring buffer area */
+	struct rte_mempool *dummy_pool;  /* single pool covering all data ring areas */
 
-    struct rte_ether_addr address;
+	struct rte_ether_addr address;
 };
 
-struct ub_ring_devargs {
-    void  *rx_addr;
-    void  *tx_addr;
-    void  *pool_addr;
-    size_t pool_sz;
-    void  *base_addr;
-};
+/* ---- helpers ---- */
 
+/**
+ * Encode an mbuf into a ub_buf for TX.
+ * Returns the ub_buf pointer (already allocated from data ring).
+ */
+static void *
+encode_mbuf_to_buf(struct rte_mbuf *m, uint32_t provider_index)
+{
+	uint32_t elt_size = rte_ub_ring_get_data_elt_size(provider_index);
 
-/* ---- RX / TX 快速路径 ---- */
+	/*
+	 * Full mbuf layout (see rte_pktmbuf_init):
+	 *   [header: sizeof(rte_mbuf)] [priv: m->priv_size] [buf: m->buf_len]
+	 *   m->buf_addr = m + sizeof(rte_mbuf) + m->priv_size
+	 */
+	uint32_t mbuf_hdr  = (uint32_t)sizeof(struct rte_mbuf);
+	uint32_t priv_size = m->priv_size;
+	uint32_t buf_len   = m->buf_len;
+	uint32_t need      = mbuf_hdr + priv_size + buf_len;
+
+	if (need > elt_size) {
+		UB_RING_ETH_LOG(ERR,
+			"mbuf too large: hdr=%u priv=%u buf=%u = %u > elt=%u",
+			mbuf_hdr, priv_size, buf_len, need, elt_size);
+		return NULL;
+	}
+
+	void *buf = rte_ub_ring_alloc_buf(provider_index);
+	if (!buf)
+		return NULL;
+
+	struct rte_mbuf *dst = buf;
+
+	/* full deep copy: header + priv + entire data buffer */
+	memcpy(buf, m, need);
+
+	/*
+	 * Fix pointer fields:
+	 *   buf_addr — no encoding needed, RX reconstructs from:
+	 *       m->buf_addr = (char*)m + sizeof(rte_mbuf) + m->priv_size
+	 *   next     — encode as {provider_index, data_ring_offset}
+	 *   pool     — NULL (RX restores to dummy pool)
+	 */
+	if (m->next) {
+		void *next_buf = encode_mbuf_to_buf(m->next, provider_index);
+		if (next_buf) {
+			uint64_t off = (uint64_t)((char *)next_buf -
+				(char *)rte_ub_ring_get_data_buf_area(provider_index));
+			dst->next = (struct rte_mbuf *)(uintptr_t)
+				(((uint64_t)provider_index << 56) | off);
+		} else {
+			UB_RING_ETH_LOG(ERR, "encode chained next failed");
+			rte_ub_ring_free_buf(buf);
+			return NULL;
+		}
+	} else {
+		dst->next = (struct rte_mbuf *)(uintptr_t)UINT64_MAX; /* all-F = NULL */
+	}
+
+	/* pool → NULL (RX restores to dummy pool) */
+	dst->pool = NULL;
+
+	return buf;
+}
+
+/**
+ * Decode a ub_buf into an mbuf (RX path).
+ * Returns the head of the mbuf chain (may be chained via next).
+ * The returned mbuf has m->pool set to the dummy pool for this provider.
+ */
+static struct rte_mbuf *
+decode_buf_to_mbuf(void *buf, struct rte_mempool *dummy_pool)
+{
+	struct rte_mbuf *m = buf; /* The buf IS the mbuf (zero-copy) */
+
+	/* reconstruct buf_addr from invariant layout */
+	m->buf_addr = (char *)m + sizeof(struct rte_mbuf) + m->priv_size;
+	m->pool     = dummy_pool;
+
+	/* decode next chain */
+	uint64_t next_val = (uint64_t)(uintptr_t)m->next;
+	if (next_val != UINT64_MAX) {
+		uint8_t  ni  = (uint8_t)(next_val >> 56);
+		uint64_t off = next_val & 0x00FFFFFFFFFFFFFFULL;
+		void *next_buf = (char *)rte_ub_ring_get_data_buf_area(ni) + off;
+		struct rte_mbuf *next_m = decode_buf_to_mbuf(next_buf, dummy_pool);
+		m->next = next_m;
+	} else {
+		m->next = NULL;
+	}
+
+	return m;
+}
+
+/**
+ * Drain the dummy pool: dequeue all freed mbufs and return
+ * each to its data ring (identified by address range).
+ */
+static void
+drain_dummy_pool(struct rte_mempool *dummy)
+{
+	if (!dummy)
+		return;
+
+	/* dequeue all available mbufs from the dummy pool and
+	 * return each to its data ring via rte_ub_ring_free_buf.
+	 * Since the dummy pool uses rte_mempool internally, we drain
+	 * by repeatedly calling rte_mempool_get until empty, then
+	 * rte_ub_ring_free_buf on each.
+	 */
+	void *objs[32];
+	int n = rte_mempool_get_bulk(dummy, objs, 32);
+	while (n > 0) {
+		for (int i = 0; i < n; i++)
+			rte_ub_ring_free_buf(objs[i]);
+		n = rte_mempool_get_bulk(dummy, objs, 32);
+	}
+}
+
+/* ---- RX / TX fast paths ---- */
 
 static uint16_t
-ub_ring_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
+ub_ring_eth_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 {
-    struct ub_ring_queue     *rq = q;
-    struct ub_ring_internals *in = rq->internals;
-    void *vals[nb_bufs];
+	struct ub_ring_eth_queue *rq = q;
+	struct ub_ring_eth_internals *in = rq->internals;
 
-    uint16_t n = (uint16_t)rte_ring_dequeue_burst(rq->rng, vals, nb_bufs, NULL);
-    if (n == 0)
-        return 0;
+	/* drain dummy pool: return previously-freed mbufs to data rings */
+	drain_dummy_pool(in->dummy_pool);
 
-    for (uint16_t i = 0; i < n; i++) {
-        uint64_t       off = (uint64_t)(uintptr_t)vals[i];
-        struct rte_mbuf *m = (struct rte_mbuf *)((char *)in->ubsmem_base + off);
-        m->buf_addr = (void *)((char *)m + sizeof(struct rte_mbuf));
-        bufs[i]     = m;
-    }
-    return n;
+	/* bulk recv from Layer 2 */
+	void *raw[UB_RING_ETH_MAX_BURST];
+	uint16_t n = rte_ub_ring_recv_burst(rq->queue_id, raw,
+		RTE_MIN(nb_bufs, UB_RING_ETH_MAX_BURST));
+
+	for (uint16_t i = 0; i < n; i++) {
+		bufs[i] = decode_buf_to_mbuf(raw[i], in->dummy_pool);
+	}
+
+	return n;
 }
-
 
 static uint16_t
-ub_ring_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
+ub_ring_eth_tx(void *q, struct rte_mbuf **mbufs, uint16_t nb_bufs)
 {
-    struct ub_ring_queue     *rq = q;
-    struct ub_ring_internals *in = rq->internals;
-    void *vals[nb_bufs];
+	struct ub_ring_eth_queue *rq = q;
+	void *raw[nb_bufs];
+	uint16_t count = 0;
 
-    for (uint16_t i = 0; i < nb_bufs; i++) {
-        uint64_t off = (uint64_t)((char *)bufs[i] - (char *)in->ubsmem_base);
-        vals[i] = (void *)(uintptr_t)off;
-    }
-    return (uint16_t)rte_ring_enqueue_burst(rq->rng, vals, nb_bufs, NULL);
+	for (uint16_t i = 0; i < nb_bufs; i++) {
+		void *buf = encode_mbuf_to_buf(mbufs[i], rq->provider_index);
+		if (!buf)
+			break;
+		raw[count++] = buf;
+	}
+
+	if (count == 0)
+		return 0;
+
+	uint16_t sent = rte_ub_ring_send_burst(rq->queue_id, raw, count);
+
+	/* free unsent buffers back to data ring */
+	for (uint16_t i = sent; i < count; i++)
+		rte_ub_ring_free_buf(raw[i]);
+
+	return sent;
 }
 
+/* ---- eth_dev_ops ---- */
 
-/* ---- eth_dev_ops 回调 ---- */
-
-static int ub_ring_dev_configure(struct rte_eth_dev *d __rte_unused)
+static int
+ub_ring_eth_dev_configure(struct rte_eth_dev *dev __rte_unused)
 { return 0; }
 
-static int ub_ring_dev_start(struct rte_eth_dev *dev)
-{ dev->data->dev_link.link_status = RTE_ETH_LINK_UP; return 0; }
-
-static int ub_ring_dev_stop(struct rte_eth_dev *dev)
+static int
+ub_ring_eth_dev_start(struct rte_eth_dev *dev)
 {
-    dev->data->dev_started = 0;
-    dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;
-    for (uint16_t i = 0; i < dev->data->nb_rx_queues; i++)
-        dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
-    for (uint16_t i = 0; i < dev->data->nb_tx_queues; i++)
-        dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
-    return 0;
+	dev->data->dev_link.link_status = RTE_ETH_LINK_UP;
+	return 0;
 }
 
-static int ub_ring_dev_set_link_down(struct rte_eth_dev *dev)
+static int
+ub_ring_eth_dev_stop(struct rte_eth_dev *dev)
 {
-    dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;
-    for (uint16_t i = 0; i < dev->data->nb_rx_queues; i++)
-        dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
-    for (uint16_t i = 0; i < dev->data->nb_tx_queues; i++)
-        dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
-    return 0;
+	dev->data->dev_started = 0;
+	dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;
+	return 0;
 }
 
-static int ub_ring_dev_set_link_up(struct rte_eth_dev *dev)
+static int
+ub_ring_eth_dev_close(struct rte_eth_dev *dev)
 {
-    dev->data->dev_link.link_status = RTE_ETH_LINK_UP;
-    return 0;
+	struct ub_ring_eth_internals *in = dev->data->dev_private;
+	ub_ring_eth_dev_stop(dev);
+
+	/* drain and free dummy pools */
+	if (in->dummy_pool) {
+		drain_dummy_pool(in->dummy_pool);
+		rte_mempool_free(in->dummy_pool);
+	}
+
+	dev->data->mac_addrs = NULL;
+	rte_free(in);
+	dev->data->dev_private = NULL;
+	rte_ub_ring_fini();
+	return 0;
 }
 
-static int ub_ring_dev_close(struct rte_eth_dev *dev)
+static int
+ub_ring_eth_dev_info(struct rte_eth_dev *dev, struct rte_eth_dev_info *info)
 {
-    struct ub_ring_internals *in = dev->data->dev_private;
-    ub_ring_dev_stop(dev);
-    dev->data->mac_addrs = NULL;
-    rte_free(in);
-    dev->data->dev_private = NULL;
-    return 0;
+	uint32_t total = rte_ub_ring_get_total_queues();
+	info->max_mac_addrs   = 1;
+	info->max_rx_pktlen   = (uint32_t)-1;
+	info->max_rx_queues    = (uint16_t)total;
+	info->max_tx_queues    = (uint16_t)total;
+	info->min_rx_bufsize   = 0;
+	info->rx_offload_capa  = RTE_ETH_RX_OFFLOAD_SCATTER;
+	info->tx_offload_capa  = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+	(void)dev;
+	return 0;
 }
 
-static int ub_ring_dev_info(struct rte_eth_dev *dev, struct rte_eth_dev_info *info)
+static int
+ub_ring_eth_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
+	uint16_t nb_rx_desc __rte_unused, unsigned int socket_id __rte_unused,
+	const struct rte_eth_rxconf *rx_conf __rte_unused,
+	struct rte_mempool *mb_pool __rte_unused)
 {
-    struct ub_ring_internals *in = dev->data->dev_private;
-    info->max_mac_addrs  = 1;
-    info->max_rx_pktlen  = (uint32_t)-1;
-    info->max_rx_queues   = (uint16_t)in->max_rx_queues;
-    info->max_tx_queues   = (uint16_t)in->max_tx_queues;
-    info->min_rx_bufsize  = 0;
-    info->rx_offload_capa = RTE_ETH_RX_OFFLOAD_SCATTER;
-    info->tx_offload_capa = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
-    return 0;
+	struct ub_ring_eth_internals *in = dev->data->dev_private;
+	uint32_t total = rte_ub_ring_get_total_queues();
+	if (rx_queue_id >= total)
+		return -EINVAL;
+	in->rx_queues[rx_queue_id].queue_id = rx_queue_id;
+	in->rx_queues[rx_queue_id].provider_index =
+		rte_ub_ring_queue_to_provider(rx_queue_id);
+	in->rx_queues[rx_queue_id].internals = in;
+	dev->data->rx_queues[rx_queue_id] = &in->rx_queues[rx_queue_id];
+	return 0;
 }
 
-static int ub_ring_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
-        uint16_t nb_rx_desc __rte_unused, unsigned int socket_id __rte_unused,
-        const struct rte_eth_rxconf *rx_conf __rte_unused,
-        struct rte_mempool *mb_pool __rte_unused)
+static int
+ub_ring_eth_tx_queue_setup(struct rte_eth_dev *dev, uint16_t tx_queue_id,
+	uint16_t nb_tx_desc __rte_unused, unsigned int socket_id __rte_unused,
+	const struct rte_eth_txconf *tx_conf __rte_unused)
 {
-    struct ub_ring_internals *in = dev->data->dev_private;
-    dev->data->rx_queues[rx_queue_id] = &in->rx_queues[rx_queue_id];
-    return 0;
+	struct ub_ring_eth_internals *in = dev->data->dev_private;
+	uint32_t total = rte_ub_ring_get_total_queues();
+	if (tx_queue_id >= total)
+		return -EINVAL;
+	in->tx_queues[tx_queue_id].queue_id = tx_queue_id;
+	in->tx_queues[tx_queue_id].provider_index =
+		rte_ub_ring_queue_to_provider(tx_queue_id);
+	in->tx_queues[tx_queue_id].internals = in;
+	dev->data->tx_queues[tx_queue_id] = &in->tx_queues[tx_queue_id];
+	return 0;
 }
 
-static int ub_ring_tx_queue_setup(struct rte_eth_dev *dev, uint16_t tx_queue_id,
-        uint16_t nb_tx_desc __rte_unused, unsigned int socket_id __rte_unused,
-        const struct rte_eth_txconf *tx_conf __rte_unused)
-{
-    struct ub_ring_internals *in = dev->data->dev_private;
-    dev->data->tx_queues[tx_queue_id] = &in->tx_queues[tx_queue_id];
-    return 0;
-}
-
-static int ub_ring_link_update(struct rte_eth_dev *d __rte_unused,
-                               int w __rte_unused)
+static int ub_ring_eth_link_update(struct rte_eth_dev *d __rte_unused,
+				   int w __rte_unused)
 { return 0; }
 
-static int ub_ring_stats_get(struct rte_eth_dev *d, struct rte_eth_stats *s)
+static int ub_ring_eth_stats_get(struct rte_eth_dev *d, struct rte_eth_stats *s)
 { (void)d; memset(s, 0, sizeof(*s)); return 0; }
 
-static int ub_ring_stats_reset(struct rte_eth_dev *d)
+static int ub_ring_eth_stats_reset(struct rte_eth_dev *d)
 { (void)d; return 0; }
 
 static int noop_ok(struct rte_eth_dev *d __rte_unused) { return 0; }
+
 static int mac_addr_add(struct rte_eth_dev *d __rte_unused,
-        struct rte_ether_addr *a __rte_unused, uint32_t i __rte_unused,
-        uint32_t p __rte_unused) { return 0; }
+	struct rte_ether_addr *a __rte_unused, uint32_t i __rte_unused,
+	uint32_t p __rte_unused) { return 0; }
+
 static void mac_addr_remove(struct rte_eth_dev *d __rte_unused,
-                            uint32_t i __rte_unused) {}
+			    uint32_t i __rte_unused) {}
 
-static const struct eth_dev_ops ub_ring_ops = {
-    .dev_configure       = ub_ring_dev_configure,
-    .dev_start           = ub_ring_dev_start,
-    .dev_stop            = ub_ring_dev_stop,
-    .dev_close           = ub_ring_dev_close,
-    .dev_infos_get       = ub_ring_dev_info,
-    .rx_queue_setup      = ub_ring_rx_queue_setup,
-    .tx_queue_setup      = ub_ring_tx_queue_setup,
-    .link_update         = ub_ring_link_update,
-    .stats_get           = ub_ring_stats_get,
-    .stats_reset         = ub_ring_stats_reset,
-    .mac_addr_add        = mac_addr_add,
-    .mac_addr_remove     = mac_addr_remove,
-    .promiscuous_enable  = noop_ok,
-    .promiscuous_disable = noop_ok,
-    .allmulticast_enable  = noop_ok,
-    .allmulticast_disable = noop_ok,
-    .dev_set_link_up     = ub_ring_dev_set_link_up,
-    .dev_set_link_down   = ub_ring_dev_set_link_down,
+static int ub_ring_eth_set_link_down(struct rte_eth_dev *dev)
+{ dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN; return 0; }
+
+static int ub_ring_eth_set_link_up(struct rte_eth_dev *dev)
+{ dev->data->dev_link.link_status = RTE_ETH_LINK_UP; return 0; }
+
+static const struct eth_dev_ops ub_ring_eth_ops = {
+	.dev_configure       = ub_ring_eth_dev_configure,
+	.dev_start           = ub_ring_eth_dev_start,
+	.dev_stop            = ub_ring_eth_dev_stop,
+	.dev_close           = ub_ring_eth_dev_close,
+	.dev_infos_get       = ub_ring_eth_dev_info,
+	.rx_queue_setup      = ub_ring_eth_rx_queue_setup,
+	.tx_queue_setup      = ub_ring_eth_tx_queue_setup,
+	.link_update         = ub_ring_eth_link_update,
+	.stats_get           = ub_ring_eth_stats_get,
+	.stats_reset         = ub_ring_eth_stats_reset,
+	.mac_addr_add        = mac_addr_add,
+	.mac_addr_remove     = mac_addr_remove,
+	.promiscuous_enable  = noop_ok,
+	.promiscuous_disable = noop_ok,
+	.allmulticast_enable  = noop_ok,
+	.allmulticast_disable = noop_ok,
+	.dev_set_link_up     = ub_ring_eth_set_link_up,
+	.dev_set_link_down   = ub_ring_eth_set_link_down,
 };
 
-
-/* ---- 内部: 创建 mbuf pool ---- */
-static struct rte_mempool *
-create_pool_internal(const char *name, void *addr, size_t sz)
-{
-    unsigned int elt_sz = sizeof(struct rte_mbuf) + RTE_MBUF_DEFAULT_BUF_SIZE;
-    struct rte_pktmbuf_pool_private priv;
-    struct rte_mempool *mp;
-    size_t per, need;
-    int ret;
-
-    mp = rte_mempool_create_empty(name, NB_MBUFS, elt_sz, POOL_CACHE,
-            sizeof(priv), rte_socket_id(),
-            RTE_MEMPOOL_F_SP_PUT | RTE_MEMPOOL_F_SC_GET);
-    if (!mp) {
-        UB_RING_LOG(ERR, "[%s] create_empty failed (rte_errno=%d)",
-                    name, rte_errno);
-        return NULL;
-    }
-
-    priv.mbuf_data_room_size = RTE_MBUF_DEFAULT_BUF_SIZE;
-    priv.mbuf_priv_size = 0;
-    rte_pktmbuf_pool_init(mp, &priv);
-
-    per  = mp->header_size + mp->elt_size + mp->trailer_size;
-    need = per * NB_MBUFS;
-    if (need > sz) {
-        UB_RING_LOG(ERR, "[%s] pool data too small: need=%zu have=%zu",
-                    name, need, sz);
-        rte_mempool_free(mp);
-        return NULL;
-    }
-
-    ret = rte_mempool_populate_iova(mp, addr, RTE_BAD_IOVA, need, NULL, NULL);
-    if (ret <= 0) {
-        UB_RING_LOG(ERR, "[%s] populate failed: %d (rte_errno=%d)",
-                    name, ret, rte_errno);
-        rte_mempool_free(mp);
-        return NULL;
-    }
-
-    rte_mempool_obj_iter(mp, rte_pktmbuf_init, NULL);
-    UB_RING_LOG(INFO, "[%s] pool ready (%d objects, total=%zu)",
-                name, ret, need);
-    return mp;
-}
-
-
-/* ---- 内部: ring 初始化 ---- */
-static int
-init_ring_if_needed(const char *name, struct rte_ring *r, const char *which)
-{
-    if (rte_ring_get_size(r) != 0) {
-        UB_RING_LOG(INFO, "[%s] %s ring already initialized (size=%u)",
-                    name, which, rte_ring_get_size(r));
-        return 0;
-    }
-    int ret = rte_ring_init(r, which, RING_COUNT,
-                            RING_F_SP_ENQ | RING_F_SC_DEQ);
-    if (ret < 0) {
-        UB_RING_LOG(ERR, "[%s] rte_ring_init %s failed (rte_errno=%d)",
-                    name, which, rte_errno);
-        return ret;
-    }
-    UB_RING_LOG(INFO, "[%s] %s ring initialized", name, which);
-    return 0;
-}
-
-
-/* ---- 内部: ethdev 创建 ---- */
-static int
-do_ub_ring_create(const char *name, struct rte_vdev_device *vdev,
-                  struct ub_ring_devargs *da)
-{
-    struct ub_ring_internals *in;
-    struct rte_eth_dev *eth_dev;
-    struct rte_eth_dev_data *data;
-    struct rte_ring *rx_ring, *tx_ring;
-    void **rx_queues, **tx_queues;
-    unsigned int nb_q = 1;
-
-    rx_ring = (struct rte_ring *)da->rx_addr;
-    tx_ring = (struct rte_ring *)da->tx_addr;
-
-    if (init_ring_if_needed(name, rx_ring, "rx") < 0 ||
-        init_ring_if_needed(name, tx_ring, "tx") < 0)
-        return -1;
-
-    struct rte_mempool *pool = NULL;
-    if (da->pool_addr) {
-        pool = create_pool_internal(name, da->pool_addr, da->pool_sz);
-        if (!pool)
-            return -1;
-    }
-
-    in = rte_zmalloc_socket(NULL, sizeof(*in), 0, rte_socket_id());
-    if (!in) {
-        if (pool) rte_mempool_free(pool);
-        return -ENOMEM;
-    }
-    in->ubsmem_base   = da->base_addr;
-    in->pool          = pool;
-    in->max_rx_queues = nb_q;
-    in->max_tx_queues = nb_q;
-
-    rx_queues = rte_calloc_socket(NULL, nb_q, sizeof(void *), 0,
-                                  rte_socket_id());
-    tx_queues = rte_calloc_socket(NULL, nb_q, sizeof(void *), 0,
-                                  rte_socket_id());
-    if (!rx_queues || !tx_queues) {
-        rte_free(rx_queues);
-        rte_free(tx_queues);
-        if (pool) rte_mempool_free(pool);
-        rte_free(in);
-        return -ENOMEM;
-    }
-
-    for (unsigned int i = 0; i < nb_q; i++) {
-        in->rx_queues[i].rng = rx_ring;
-        in->rx_queues[i].internals = in;
-        in->tx_queues[i].rng = tx_ring;
-        in->tx_queues[i].internals = in;
-    }
-
-    eth_dev = rte_eth_dev_allocate(name);
-    if (!eth_dev) {
-        UB_RING_LOG(ERR, "[%s] rte_eth_dev_allocate failed", name);
-        rte_free(rx_queues);
-        rte_free(tx_queues);
-        if (pool) rte_mempool_free(pool);
-        rte_free(in);
-        return -ENODEV;
-    }
-
-    eth_dev->device = &vdev->device;
-    data = eth_dev->data;
-    data->rx_queues    = rx_queues;
-    data->tx_queues    = tx_queues;
-    data->nb_rx_queues = (uint16_t)nb_q;
-    data->nb_tx_queues = (uint16_t)nb_q;
-    data->dev_private  = in;
-    data->numa_node     = rte_socket_id();
-    data->promiscuous   = 1;
-    data->all_multicast = 1;
-    data->dev_flags    |= RTE_ETH_DEV_AUTOFILL_QUEUE_XSTATS;
-
-    /* 直接赋值队列指针 (ring PMD 在 create 中直接赋值, 不依赖 queue_setup) */
-    for (unsigned int i = 0; i < nb_q; i++) {
-        data->rx_queues[i] = &in->rx_queues[i];
-        data->tx_queues[i] = &in->tx_queues[i];
-    }
-
-    in->address = (struct rte_ether_addr){
-        .addr_bytes = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 }
-    };
-    data->mac_addrs = &in->address;
-    data->dev_link = (struct rte_eth_link){
-        .link_speed  = RTE_ETH_SPEED_NUM_10G,
-        .link_duplex = RTE_ETH_LINK_FULL_DUPLEX,
-        .link_status = RTE_ETH_LINK_DOWN,
-        .link_autoneg = RTE_ETH_LINK_FIXED,
-    };
-
-    eth_dev->dev_ops      = &ub_ring_ops;
-    eth_dev->rx_pkt_burst = ub_ring_rx;
-    eth_dev->tx_pkt_burst = ub_ring_tx;
-
-    rte_eth_dev_probing_finish(eth_dev);
-    return data->port_id;
-}
-
-
-/* ---- devargs 解析 ---- */
+/* ---- internal: create ethdev ---- */
 
 static int
-parse_hex_addr(const char *key __rte_unused, const char *value,
-               void *extra_args)
+do_eth_dev_create(const char *name, uint32_t nb_queues,
+		  struct ub_ring_eth_internals *in)
 {
-    void **dst = extra_args;
-    char *end;
-    uintptr_t addr = strtoull(value, &end, 0);
-    if (*end != '\0')
-        return -EINVAL;
-    *dst = (void *)addr;
-    return 0;
+	struct rte_eth_dev *eth_dev;
+	struct rte_eth_dev_data *data;
+	void **rx_queues, **tx_queues;
+
+	rx_queues = rte_calloc_socket(NULL, nb_queues, sizeof(void *), 0,
+				      rte_socket_id());
+	tx_queues = rte_calloc_socket(NULL, nb_queues, sizeof(void *), 0,
+				      rte_socket_id());
+	if (!rx_queues || !tx_queues) {
+		rte_free(rx_queues);
+		rte_free(tx_queues);
+		return -ENOMEM;
+	}
+
+	for (uint32_t i = 0; i < nb_queues; i++) {
+		in->rx_queues[i].queue_id = i;
+		in->tx_queues[i].queue_id = i;
+	}
+
+	eth_dev = rte_eth_dev_allocate(name);
+	if (!eth_dev) {
+		UB_RING_ETH_LOG(ERR, "[%s] rte_eth_dev_allocate failed", name);
+		rte_free(rx_queues);
+		rte_free(tx_queues);
+		return -ENODEV;
+	}
+
+	data = eth_dev->data;
+	data->rx_queues    = rx_queues;
+	data->tx_queues    = tx_queues;
+	data->nb_rx_queues = (uint16_t)nb_queues;
+	data->nb_tx_queues = (uint16_t)nb_queues;
+	data->dev_private  = in;
+	data->numa_node     = rte_socket_id();
+	data->promiscuous   = 1;
+	data->all_multicast = 1;
+	data->dev_flags    |= RTE_ETH_DEV_AUTOFILL_QUEUE_XSTATS;
+
+	for (uint32_t i = 0; i < nb_queues; i++) {
+		data->rx_queues[i] = &in->rx_queues[i];
+		data->tx_queues[i] = &in->tx_queues[i];
+	}
+
+	in->address = (struct rte_ether_addr){
+		.addr_bytes = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 }
+	};
+	data->mac_addrs = &in->address;
+	data->dev_link = (struct rte_eth_link){
+		.link_speed  = RTE_ETH_SPEED_NUM_10G,
+		.link_duplex = RTE_ETH_LINK_FULL_DUPLEX,
+		.link_status = RTE_ETH_LINK_DOWN,
+		.link_autoneg = RTE_ETH_LINK_FIXED,
+	};
+
+	eth_dev->dev_ops      = &ub_ring_eth_ops;
+	eth_dev->rx_pkt_burst = ub_ring_eth_rx;
+	eth_dev->tx_pkt_burst = ub_ring_eth_tx;
+
+	rte_eth_dev_probing_finish(eth_dev);
+	return data->port_id;
 }
 
+/**
+ * Create dummy pools for all provider data ring areas.
+ * Each dummy pool is backed by the provider's data ring buffer area
+ * so that rte_pktmbuf_free(m) works correctly.
+ */
 static int
-parse_size(const char *key __rte_unused, const char *value,
-           void *extra_args)
+create_dummy_pool(struct ub_ring_eth_internals *in)
 {
-    size_t *dst = extra_args;
-    char *end;
-    *dst = strtoull(value, &end, 0);
-    if (*end != '\0')
-        return -EINVAL;
-    return 0;
+	struct rte_mempool *mp = rte_mempool_create_empty("ub_eth_dummy",
+		1024, 1, 0, 0, rte_socket_id(),
+		RTE_MEMPOOL_F_SP_PUT | RTE_MEMPOOL_F_SC_GET);
+	if (!mp)
+		return -1;
+
+	in->dummy_pool = mp;
+	UB_RING_ETH_LOG(INFO, "dummy pool created (empty, no populate)");
+	return 0;
 }
 
+/* ---- public API ---- */
 
-/* ---- vdev probe / remove ---- */
-
-static int
-ub_ring_vdev_probe(struct rte_vdev_device *vdev)
+int
+rte_eth_ub_ring_create_provider(const char *name,
+	const char **ub_nodes, uint32_t nb_nodes,
+	const char *region, const char *shm_prefix,
+	size_t shm_size, uint32_t nb_queues, uint32_t queue_depth)
 {
-    const char *devname = rte_vdev_device_name(vdev);
-    struct ub_ring_devargs da;
-    struct rte_kvargs *kv;
+	int ret = rte_ub_ring_provider_init(ub_nodes, nb_nodes, region,
+					    shm_prefix, shm_size,
+					    nb_queues, queue_depth);
+	if (ret < 0)
+		return ret;
 
-    if (!devname)
-        return -EINVAL;
+	struct ub_ring_eth_internals *in = rte_zmalloc_socket(NULL, sizeof(*in),
+		0, rte_socket_id());
+	if (!in)
+		return -ENOMEM;
 
-    /* 跳过 "net_ub_ring_" 前缀获取 short name */
-    const char *short_name = devname;
-    const char *prefix = "net_ub_ring_";
-    size_t plen = strlen(prefix);
-    if (strncmp(devname, prefix, plen) == 0)
-        short_name = devname + plen;
+	create_dummy_pool(in);
 
-    memset(&da, 0, sizeof(da));
-
-    kv = rte_kvargs_parse(rte_vdev_device_args(vdev), NULL);
-    if (!kv)
-        return -EINVAL;
-
-    if (rte_kvargs_process(kv, UB_RING_ARG_RX,   parse_hex_addr, &da.rx_addr) < 0 ||
-        rte_kvargs_process(kv, UB_RING_ARG_TX,   parse_hex_addr, &da.tx_addr) < 0 ||
-        rte_kvargs_process(kv, UB_RING_ARG_BASE, parse_hex_addr, &da.base_addr) < 0) {
-        UB_RING_LOG(ERR, "[%s] failed to parse rx/tx/base args", devname);
-        rte_kvargs_free(kv);
-        return -EINVAL;
-    }
-
-    /* pool 和 pool_sz 可选 */
-    rte_kvargs_process(kv, UB_RING_ARG_POOL,    parse_hex_addr, &da.pool_addr);
-    rte_kvargs_process(kv, UB_RING_ARG_POOL_SZ, parse_size,    &da.pool_sz);
-
-    rte_kvargs_free(kv);
-
-    return do_ub_ring_create(short_name, vdev, &da);
+	return do_eth_dev_create(name, nb_queues, in);
 }
 
-static int
-ub_ring_vdev_remove(struct rte_vdev_device *vdev)
+int
+rte_eth_ub_ring_create_user(const char *name,
+	const char **ub_nodes, uint32_t nb_nodes,
+	const char *region, const char *shm_prefix,
+	uint32_t data_elt_size)
 {
-    const char *name = rte_vdev_device_name(vdev);
-    struct rte_eth_dev *eth_dev;
+	int ret = rte_ub_ring_user_init(ub_nodes, nb_nodes, region,
+					shm_prefix, data_elt_size);
+	if (ret < 0)
+		return ret;
 
-    if (!name)
-        return -EINVAL;
+	uint32_t total = rte_ub_ring_get_total_queues();
 
-    eth_dev = rte_eth_dev_allocated(name);
-    if (!eth_dev)
-        return 0;
+	struct ub_ring_eth_internals *in = rte_zmalloc_socket(NULL, sizeof(*in),
+		0, rte_socket_id());
+	if (!in)
+		return -ENOMEM;
 
-    ub_ring_dev_close(eth_dev);
-    rte_eth_dev_release_port(eth_dev);
-    return 0;
+	create_dummy_pool(in);
+
+	return do_eth_dev_create(name, total, in);
 }
 
-static struct rte_vdev_driver ub_ring_vdev_drv = {
-    .probe  = ub_ring_vdev_probe,
-    .remove = ub_ring_vdev_remove,
-};
-
-RTE_PMD_REGISTER_VDEV(net_ub_ring, ub_ring_vdev_drv);
+int
+rte_eth_ub_ring_get_queue_mapping(uint32_t provider_node_index,
+				   uint32_t sub_queue,
+				   uint32_t *tx_queue_id,
+				   uint32_t *rx_queue_id)
+{
+	return rte_ub_ring_get_queue_mapping(provider_node_index,
+					      sub_queue, tx_queue_id,
+					      rx_queue_id);
+}
