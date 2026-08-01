@@ -2,9 +2,11 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <sys/mman.h>
 
 #include <ubs_mem.h>
 
@@ -83,7 +85,6 @@ struct ub_ring_ctx {
 
 	char     region_name[64];
 	char     shm_prefix[64];
-	size_t   shm_size;
 };
 
 static struct ub_ring_ctx *g_ctx;
@@ -104,7 +105,11 @@ static int find_peer_by_buf(const void *buf);
 static int
 cmp_node(const void *a, const void *b)
 {
-	return strcmp(*(const char **)a, *(const char **)b);
+	const char *sa = *(const char **)a;
+	const char *sb = *(const char **)b;
+	if (!sa) return sb ? -1 : 0;
+	if (!sb) return 1;
+	return strcmp(sa, sb);
 }
 
 /*
@@ -231,7 +236,7 @@ rte_ub_ring_provider_init(const char **ub_nodes, uint32_t nb_nodes,
 	if (!ub_nodes || nb_nodes == 0 || nb_nodes > UB_RING_MAX_NODES ||
 	    !region || !shm_prefix || shm_size == 0 ||
 	    nb_queues == 0 || nb_queues > UB_RING_MAX_QUEUES ||
-	    queue_depth == 0) {
+	    queue_depth == 0 || !rte_is_power_of_2(queue_depth)) {
 		rte_errno = EINVAL;
 		return -EINVAL;
 	}
@@ -247,8 +252,14 @@ rte_ub_ring_provider_init(const char **ub_nodes, uint32_t nb_nodes,
 	sorted = rte_malloc(NULL, nb_nodes * sizeof(char *), 0);
 	if (!sorted)
 		goto fail;
-	for (uint32_t i = 0; i < nb_nodes; i++)
+	for (uint32_t i = 0; i < nb_nodes; i++) {
+		if (!ub_nodes[i]) {
+			UB_RING_LOG(ERR, "ub_nodes[%u] is NULL", i);
+			rte_free(sorted);
+			goto fail;
+		}
 		sorted[i] = ub_nodes[i];
+	}
 	qsort(sorted, nb_nodes, sizeof(char *), cmp_node);
 
 	if (gethostname(my_hostname, sizeof(my_hostname)) != 0) {
@@ -270,6 +281,9 @@ rte_ub_ring_provider_init(const char **ub_nodes, uint32_t nb_nodes,
 
 	g_ctx->nb_nodes     = nb_nodes;
 	g_ctx->my_node_index = my_index;
+
+	UB_RING_LOG(INFO, "hostname='%s' → sorted index=%u (nb_nodes=%u)",
+		    my_hostname, my_index, nb_nodes);
 
 	UB_RING_LOG(INFO, "provider init: my_index=%u, nb_nodes=%u, "
 		    "nb_queues=%u, queue_depth=%u",
@@ -485,8 +499,14 @@ rte_ub_ring_user_init(const char **ub_nodes, uint32_t nb_nodes,
 	sorted = rte_malloc(NULL, nb_nodes * sizeof(char *), 0);
 	if (!sorted)
 		goto fail;
-	for (uint32_t i = 0; i < nb_nodes; i++)
+	for (uint32_t i = 0; i < nb_nodes; i++) {
+		if (!ub_nodes[i]) {
+			UB_RING_LOG(ERR, "ub_nodes[%u] is NULL", i);
+			rte_free(sorted);
+			goto fail;
+		}
 		sorted[i] = ub_nodes[i];
+	}
 	qsort(sorted, nb_nodes, sizeof(char *), cmp_node);
 
 	if (gethostname(my_hostname, sizeof(my_hostname)) != 0) {
@@ -507,6 +527,9 @@ rte_ub_ring_user_init(const char **ub_nodes, uint32_t nb_nodes,
 	}
 	g_ctx->nb_nodes     = nb_nodes;
 	g_ctx->my_node_index = my_index;
+
+	UB_RING_LOG(INFO, "hostname='%s' → sorted index=%u (nb_nodes=%u)",
+		    my_hostname, my_index, nb_nodes);
 
 	UB_RING_LOG(INFO, "user init: my_index=%u, nb_nodes=%u, data_elt_size=%u",
 		    my_index, nb_nodes, data_elt_size);
@@ -598,9 +621,11 @@ rte_ub_ring_user_init(const char **ub_nodes, uint32_t nb_nodes,
 		 * Estimate N algebraically, then adjust down until it fits. */
 		uint32_t max_idx = (uint32_t)((dr_sz - sizeof(struct rte_ring)) /
 					      (8 + data_elt_size));
+		/* round down to power of 2 (ring requirement) */
+		max_idx = rte_align32prevpow2(max_idx);
 		while (rte_ring_get_memsize(max_idx) +
 		       (size_t)max_idx * data_elt_size > dr_sz)
-			max_idx--;
+			max_idx /= 2;
 		size_t idx_ring_memsize = rte_ring_get_memsize(max_idx);
 
 		if (max_idx < 2) {
@@ -671,9 +696,10 @@ rte_ub_ring_user_init(const char **ub_nodes, uint32_t nb_nodes,
 		struct ub_ring_metadata *meta = peer_meta(pi);
 		void *shm = g_ctx->peers[pi].shm_base;
 		for (uint32_t q = 0; q < nq; q++) {
-			g_ctx->rx_rings[idx] = (struct rte_ring *)((char *)shm +
-				meta->queue_offsets[q]);
+			/* crossed: provider rx → user tx, provider tx → user rx */
 			g_ctx->tx_rings[idx] = (struct rte_ring *)((char *)shm +
+				meta->queue_offsets[q]);
+			g_ctx->rx_rings[idx] = (struct rte_ring *)((char *)shm +
 				meta->queue_offsets[nq + q]);
 			g_ctx->queue_to_provider[idx] = pi;
 			idx++;
@@ -744,7 +770,20 @@ rte_ub_ring_get_data_elt_size(uint32_t provider_node_index)
 {
 	if (!g_ctx || provider_node_index >= g_ctx->nb_nodes)
 		return 0;
-	return g_ctx->peers[provider_node_index].data_elt_size;
+	sync_peer_data_ring(provider_node_index);
+	uint32_t sz = g_ctx->peers[provider_node_index].data_elt_size;
+	if (sz == 0) {
+		struct ub_ring_metadata *m = peer_meta(provider_node_index);
+		UB_RING_LOG(ERR, "data_elt_size is 0 for peer %u: "
+			    "ctx=%p meta=%p meta->data_elt=%u "
+			    "ctx->buf_area=%p ctx->buf_end=%p ctx->data_ring=%p",
+			    provider_node_index, (void *)g_ctx, (void *)m,
+			    m ? m->data_elt_size : 0,
+			    g_ctx->peers[provider_node_index].data_buf_area,
+			    g_ctx->peers[provider_node_index].data_buf_end,
+			    (void *)g_ctx->peers[provider_node_index].data_ring);
+	}
+	return sz;
 }
 
 void *
@@ -796,6 +835,7 @@ rte_ub_ring_recv_burst(uint32_t queue_id, void **bufs, uint16_t nb)
 	for (uint16_t i = 0; i < n; i++) {
 		uint8_t  ni  = ub_ring_elem_get_node(elems[i]);
 		uint64_t off = ub_ring_elem_get_offset(elems[i]);
+		sync_peer_data_ring(ni);
 		bufs[i] = (char *)g_ctx->peers[ni].data_buf_area + off;
 	}
 
@@ -814,7 +854,8 @@ rte_ub_ring_get_queue_mapping(uint32_t provider_node_index,
 {
 	if (!g_ctx || !tx_queue_id || !rx_queue_id)
 		return -EINVAL;
-	if (sub_queue >= peer_meta(provider_node_index)->nb_queues)
+	struct ub_ring_metadata *m = peer_meta(provider_node_index);
+	if (!m || sub_queue >= m->nb_queues)
 		return -EINVAL;
 
 	uint32_t qid = g_ctx->provider_base_qid[provider_node_index] + sub_queue;

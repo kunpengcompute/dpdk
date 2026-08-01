@@ -32,7 +32,9 @@ main(int argc, char **argv)
 
 	const char *ub_nodes[] = {"master", "worker1"};
 	uint32_t nb_nodes = 2;
-	uint32_t data_elt_size = sizeof(struct rte_mbuf) + RTE_MBUF_DEFAULT_BUF_SIZE;
+
+	uint32_t data_elt_size = sizeof(struct rte_mbuf) +
+				  RTE_MBUF_DEFAULT_BUF_SIZE;
 
 	int port_id = rte_eth_ub_ring_create_user("client_eth",
 		ub_nodes, nb_nodes, "region1", "ubring", data_elt_size);
@@ -89,6 +91,7 @@ main(int argc, char **argv)
 		/* back->pool is dummy pool → rte_pktmbuf_free goes to dummy,
 		 * next RX will drain it back to data ring */
 		rte_pktmbuf_free(back);
+		rte_pktmbuf_free(m);
 		printf("[Client] #%d freed\n", i);
 
 		rte_delay_us(SEND_INTERVAL_US);

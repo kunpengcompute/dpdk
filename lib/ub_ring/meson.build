@@ -2,6 +2,7 @@
 
 sources = files('rte_ub_ring.c')
 headers = files('rte_ub_ring.h')
+deps += 'ring'
 
 # External ubsmem dependency
 ubsmem_inc = include_directories('/usr/local/ubs_mem/include')

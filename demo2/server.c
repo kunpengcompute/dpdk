@@ -70,6 +70,7 @@ main(int argc, char **argv)
 			received++;
 			while (rte_eth_tx_burst(port_id, 0, &pkts[i], 1) == 0)
 				;
+			rte_pktmbuf_free(pkts[i]);
 		}
 	}
 
