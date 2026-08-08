@@ -600,6 +600,12 @@ int rte_ub_ring_get_peer_index(struct rte_ub_ring_handle *h, const char *hostnam
  *  MPMC
  * ================================================================ */
 
+bool
+rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h)
+{
+	return h && h->mpmc_enabled;
+}
+
 int
 rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h)
 {

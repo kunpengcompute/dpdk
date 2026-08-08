@@ -4,9 +4,10 @@
 #define RTE_ETH_UB_RING_H
 
 #include <stdint.h>
-#include <rte_mbuf.h>
+#include <stdio.h>
 #include <rte_ethdev.h>
-#include <rte_ub_ring.h>
+
+struct rte_ub_ring_handle;
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,12 +16,12 @@ extern "C" {
 /**
  * Attach ub_ring handle to an ethdev port.
  *
- * Uses all queues from the handle. Internally checks h->mpmc_enabled
- * to decide whether to use mp_send_burst/mc_recv_burst or send_burst/recv_burst.
+ * Builds a devargs string and calls rte_dev_probe() internally.
+ * The PMD vdev probe handles the rest. dev->device is properly set.
  *
  * @param name  ethdev port name
- * @param h     ub_ring handle (from provider_init or user_init)
- * @return port_id (>=0) on success, negative on error
+ * @param h     ub_ring handle
+ * @return port_id on success, -1 on error
  */
 int rte_eth_ub_ring_attach(const char *name, struct rte_ub_ring_handle *h);
 
@@ -28,4 +29,4 @@ int rte_eth_ub_ring_attach(const char *name, struct rte_ub_ring_handle *h);
 }
 #endif
 
-#endif /* RTE_ETH_UB_RING_H */
+#endif

@@ -3,7 +3,8 @@ project(dpdk-ub-ring-demo C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_EXTENSIONS ON)
-set(CMAKE_C_FLAGS_RELEASE "-O2")
+set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_C_FLAGS_DEBUG "-O0 -g")
 
 # ---- DPDK ----
 find_package(PkgConfig REQUIRED)
@@ -17,9 +18,9 @@ link_directories(${UBSM_DIR}/lib)
 # ---- Server ----
 add_executable(server server.c)
 target_include_directories(server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(server PRIVATE PkgConfig::DPDK pthread dl numa)
+target_link_libraries(server PRIVATE PkgConfig::DPDK rte_net_ub_ring pthread dl numa)
 
 # ---- Client ----
 add_executable(client client.c)
 target_include_directories(client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(client PRIVATE PkgConfig::DPDK pthread dl numa)
+target_link_libraries(client PRIVATE PkgConfig::DPDK rte_net_ub_ring pthread dl numa)

@@ -224,6 +224,7 @@ uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h,
  * Creates local shadow_tx/shadow_rx per queue.
  */
 int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h);
+bool rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h);
 
 /**
  * MPMC send (multi-producer safe): enqueue to shadow_tx[qid].

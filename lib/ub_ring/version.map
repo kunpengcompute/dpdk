@@ -16,6 +16,7 @@ DPDK_25 {
 	rte_ub_ring_send_burst;
 	rte_ub_ring_user_init;
 	rte_ub_ring_enable_mpmc;
+	rte_ub_ring_is_mpmc_enabled;
 	rte_ub_ring_flush_rx;
 	rte_ub_ring_flush_tx;
 	rte_ub_ring_mc_recv_burst;
