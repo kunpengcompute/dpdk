@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Server — 4 workers, auto-exit after NP total RX.
+ * Server — 4 workers, rx + free, auto-exit after NP total.
  * Run: ./server --no-huge -l 1-5
  */
 #include <stdio.h>
@@ -29,12 +29,15 @@ static int worker(void *a)
 		uint16_t n = rte_eth_rx_burst(ta->pid, ta->qid, pkts, BS);
 		for (uint16_t i = 0; i < n; i++) {
 			uint32_t l = rte_pktmbuf_data_len(pkts[i]);
-			printf("[Srv q%u] RX %.*s\n", ta->qid, l,
-			       rte_pktmbuf_mtod(pkts[i], char *));
-			while (!rte_eth_tx_burst(ta->pid, ta->qid, &pkts[i], 1));
+			printf("[Srv q%u] RX %.*s (pool=%p)\n", ta->qid, l,
+			       rte_pktmbuf_mtod(pkts[i], char *),
+			       (void *)pkts[i]->pool);
+			fflush(stdout);
 			rte_pktmbuf_free(pkts[i]);
-			__atomic_fetch_add(&g_total, 1, __ATOMIC_RELAXED);
-			if (g_total >= NP) { g_running = 0; return 0; }
+			int t = __atomic_add_fetch(&g_total, 1, __ATOMIC_RELAXED);
+			printf("[Srv q%u] total=%d/%d\n", ta->qid, t, NP);
+			fflush(stdout);
+			if (t >= NP) { g_running = 0; return 0; }
 		}
 	}
 	return 0;

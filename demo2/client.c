@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Client — w0 RR q0/q1, w1 RR q2/q3, 1 flush, main recv echo.
+ * Client — w0 RR q0/q1, w1 RR q2/q3, 1 flush, fire-and-forget.
  * Run: ./client --no-huge -l 1-4
  */
 #include <stdio.h>
@@ -31,6 +31,7 @@ static int flush_worker(void *arg)
 			rte_ub_ring_flush_tx(g_h, q);
 			rte_ub_ring_flush_rx(g_h, q);
 		}
+		rte_ub_ring_collect(g_h);
 		usleep(50);
 	}
 	return 0;
@@ -48,7 +49,7 @@ static int sender(void *a)
 		char buf[64]; int l = snprintf(buf, 64, "Hello #%d", i);
 		rte_pktmbuf_append(m, l);
 		rte_memcpy(rte_pktmbuf_mtod(m, char *), buf, l);
-		printf("[Cli lc%u] TX #%d → q%u\n", rte_lcore_id(), i, q);
+		printf("[Cli lc%u] TX #%d -> q%u\n", rte_lcore_id(), i, q);
 		while (!rte_eth_tx_burst(sa->pid, q, &m, 1));
 		rte_pktmbuf_free(m);
 		rte_delay_us(SEND_US);
@@ -89,26 +90,11 @@ int main(int argc, char **argv)
 	struct sarg s0 = { pid, 0, 1, mp }, s1 = { pid, 2, 3, mp };
 	rte_eal_remote_launch(sender, &s0, lc[1]);
 	rte_eal_remote_launch(sender, &s1, lc[2]);
+	rte_eal_wait_lcore(lc[1]); rte_eal_wait_lcore(lc[2]);
 
-	/* main thread recv echoes */
-	int rx = 0;
-	struct rte_mbuf *pkts[BS];
-	while (rx < NP) {
-		for (uint32_t q = 0; q < NQ; q++) {
-			uint16_t n = rte_eth_rx_burst(pid, q, pkts, BS);
-			for (uint16_t i = 0; i < n; i++) {
-				uint32_t l = rte_pktmbuf_data_len(pkts[i]);
-				printf("[Cli q%u] echo: %.*s\n", q, l,
-				       rte_pktmbuf_mtod(pkts[i], char *));
-				rte_pktmbuf_free(pkts[i]);
-				rx++;
-			}
-		}
-	}
-
-	printf("\n[Client] done (%d echoes)\n", rx);
+	printf("\n[Client] done\n");
 	g_running = 0;
-	rte_eal_wait_lcore(lc[0]); rte_eal_wait_lcore(lc[1]); rte_eal_wait_lcore(lc[2]);
+	rte_eal_wait_lcore(lc[0]);
 	rte_eth_dev_stop(pid); rte_eth_dev_close(pid); rte_ub_ring_fini(h);
 	rte_mempool_free(mp);
 	rte_eal_cleanup();

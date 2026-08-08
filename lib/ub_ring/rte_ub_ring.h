@@ -45,6 +45,7 @@ struct ub_ring_metadata {
 	uint32_t state;                    /* bitmask: meta_ready | data_ring_ready */
 	uint32_t data_elt_size;            /* size of each buffer element */
 	uint32_t data_nb_bufs;             /* number of buffers */
+	uint64_t data_ring_offset;         /* return ring offset from shm base */
 	uint64_t total_size;
 	uint64_t ring_area_offset;         /* tx/rx ring area offset from shm base */
 	uint64_t ring_area_size;           /* tx/rx ring area total size */
@@ -160,24 +161,27 @@ uint32_t rte_ub_ring_queue_to_provider(struct rte_ub_ring_handle *h,
 uint32_t rte_ub_ring_get_total_queues(struct rte_ub_ring_handle *h);
 
 /**
- * Allocate a buffer from a provider's data ring.
- * Dequeues an offset from the data ring, returns pointer to the buffer.
- *
- * @param h                     handle from init
- * @param provider_node_index   which provider's data ring
- * @return buffer pointer, or NULL if ring empty
+ * Allocate a buffer from a provider's local data ring (user only).
  */
 void *rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h,
 			    uint32_t provider_node_index);
 
 /**
- * Free a buffer back to its data ring.
- * Computes buffer offset and enqueues it to the owning data ring (MPSC).
- *
- * @param h    handle from init
- * @param buf  buffer pointer (must be from alloc_buf)
+ * Free a buffer back to local data ring (user) or return ring (provider).
  */
 void rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf);
+
+/**
+ * Return a used buffer to the provider's return ring (provider side).
+ * Provider workers call this after processing a buffer.
+ */
+void rte_ub_ring_return_buf(struct rte_ub_ring_handle *h, void *buf);
+
+/**
+ * Collect all buffers from return rings and enqueue to local data rings.
+ * User side only. Should be called from the flush path.
+ */
+void rte_ub_ring_collect(struct rte_ub_ring_handle *h);
 
 /**
  * Get the data element size for a provider's data ring.
