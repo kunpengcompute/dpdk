@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-sources = files('rte_ub_ring.c')
+sources = files('rte_ub_ring.c', 'rte_ub_bootstrap.c')
 headers = files('rte_ub_ring.h')
 deps += 'ring'
 

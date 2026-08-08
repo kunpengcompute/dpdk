@@ -74,6 +74,10 @@ ub_ring_elem_get_offset(void *elem)
 	return (uint64_t)((uintptr_t)elem & 0x00FFFFFFFFFFFFFFULL);
 }
 
+/* ---- opaque handle ---- */
+
+struct rte_ub_ring_handle;
+
 /* ---- role enum ---- */
 
 enum ub_ring_role {
@@ -88,22 +92,27 @@ enum ub_ring_role {
 /**
  * Provider initialization.
  *
- * Creates own shm, initializes tx/rx rings, writes metadata.
- * Data ring area is left uninitialized — user will set it up.
+ * Creates own ubsmem shm, initializes tx/rx rings, writes metadata,
+ * registers in bootstrap. Waits for bootstrap READY before mapping
+ * peer shms. Data ring area left uninitialized for user.
  *
- * @param ub_nodes      All participating node hostnames
- * @param nb_nodes      Number of nodes
- * @param region        ubsmem region name
- * @param shm_prefix    Shared memory name prefix ("{prefix}_{hostname}")
- * @param shm_size      Shared memory size (bytes)
- * @param nb_queues     Number of queues per direction
- * @param queue_depth   Ring element count (must be power of 2)
- * @return 0 on success, negative on error
+ * @param provider_nodes  Provider node hostnames (self must be included)
+ * @param nb_providers    Number of provider nodes
+ * @param user_nodes      User node hostnames (NULL if nb_users==0)
+ * @param nb_users        Number of user nodes
+ * @param region          ubsmem region name
+ * @param shm_prefix      shm name prefix ("{prefix}_{hostname}")
+ * @param shm_size        Shared memory size in bytes
+ * @param nb_queues       Number of queues per direction
+ * @param queue_depth     Ring element count (must be power of 2)
+ * @return handle on success, NULL on error
  */
-int rte_ub_ring_provider_init(const char **ub_nodes, uint32_t nb_nodes,
-			      const char *region, const char *shm_prefix,
-			      size_t shm_size, uint32_t nb_queues,
-			      uint32_t queue_depth);
+struct rte_ub_ring_handle *
+rte_ub_ring_provider_init(const char **provider_nodes, uint32_t nb_providers,
+			  const char **user_nodes, uint32_t nb_users,
+			  const char *region, const char *shm_prefix,
+			  size_t shm_size, uint32_t nb_queues,
+			  uint32_t queue_depth);
 
 /* ================================================================
  *  User API
@@ -112,93 +121,104 @@ int rte_ub_ring_provider_init(const char **ub_nodes, uint32_t nb_nodes,
 /**
  * User initialization.
  *
- * Maps all provider shms, reads metadata, initializes data rings
- * on each provider shm (index ring + buffer array), populates with
- * free buffer indices. Collects all tx/rx ring pointers.
+ * Maps all provider shms via bootstrap, initializes data rings on each
+ * provider shm, populates free buffers, collects tx/rx ring pointers.
  *
- * @param ub_nodes       All node hostnames
- * @param nb_nodes       Number of nodes
- * @param region         ubsmem region name
- * @param shm_prefix     Shared memory name prefix
- * @param data_elt_size  Size of each buffer in the data ring
- * @return 0 on success, negative on error
+ * @param provider_nodes  Provider node hostnames
+ * @param nb_providers    Number of provider nodes
+ * @param user_nodes      User node hostnames (self must be included)
+ * @param nb_users        Number of user nodes
+ * @param region          ubsmem region name
+ * @param shm_prefix      shm name prefix
+ * @param data_elt_size   Size of each data ring buffer element
+ * @return handle on success, NULL on error
  */
-int rte_ub_ring_user_init(const char **ub_nodes, uint32_t nb_nodes,
-			  const char *region, const char *shm_prefix,
-			  uint32_t data_elt_size);
+struct rte_ub_ring_handle *
+rte_ub_ring_user_init(const char **provider_nodes, uint32_t nb_providers,
+		      const char **user_nodes, uint32_t nb_users,
+		      const char *region, const char *shm_prefix,
+		      uint32_t data_elt_size);
 
 /* ================================================================
- *  Common API
+ *  Common API — all take handle from init
  * ================================================================ */
 
-int rte_ub_ring_get_node_index(uint32_t *idx);
-int rte_ub_ring_get_peer_index(const char *hostname, uint32_t *idx);
+int rte_ub_ring_get_node_index(struct rte_ub_ring_handle *h, uint32_t *idx);
+int rte_ub_ring_get_peer_index(struct rte_ub_ring_handle *h,
+			       const char *hostname, uint32_t *idx);
 
-int rte_ub_ring_get_queue_mapping(uint32_t provider_node_index,
-				   uint32_t sub_queue,
-				   uint32_t *tx_queue_id,
-				   uint32_t *rx_queue_id);
+int rte_ub_ring_get_queue_mapping(struct rte_ub_ring_handle *h,
+				  uint32_t provider_node_index,
+				  uint32_t sub_queue,
+				  uint32_t *tx_queue_id,
+				  uint32_t *rx_queue_id);
 
 /** O(1) reverse lookup: global queue_id → provider node_index */
-uint32_t rte_ub_ring_queue_to_provider(uint32_t queue_id);
+uint32_t rte_ub_ring_queue_to_provider(struct rte_ub_ring_handle *h,
+				       uint32_t queue_id);
 
-uint32_t rte_ub_ring_get_total_queues(void);
+uint32_t rte_ub_ring_get_total_queues(struct rte_ub_ring_handle *h);
 
 /**
  * Allocate a buffer from a provider's data ring.
- * Dequeues an index from the data ring, returns pointer to the buffer.
+ * Dequeues an offset from the data ring, returns pointer to the buffer.
  *
- * @param provider_node_index  Which provider's data ring
+ * @param h                     handle from init
+ * @param provider_node_index   which provider's data ring
  * @return buffer pointer, or NULL if ring empty
  */
-void *rte_ub_ring_alloc_buf(uint32_t provider_node_index);
+void *rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h,
+			    uint32_t provider_node_index);
 
 /**
  * Free a buffer back to its data ring.
- * Computes buffer index and enqueues it to the owning data ring (MPSC).
+ * Computes buffer offset and enqueues it to the owning data ring (MPSC).
  *
- * @param buf  Buffer pointer (must be from alloc_buf)
+ * @param h    handle from init
+ * @param buf  buffer pointer (must be from alloc_buf)
  */
-void rte_ub_ring_free_buf(void *buf);
+void rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf);
 
 /**
  * Get the data element size for a provider's data ring.
  */
-uint32_t rte_ub_ring_get_data_elt_size(uint32_t provider_node_index);
+uint32_t rte_ub_ring_get_data_elt_size(struct rte_ub_ring_handle *h,
+				       uint32_t provider_node_index);
 
 /**
  * Get a provider's data ring buffer area base address.
  */
-void *rte_ub_ring_get_data_buf_area(uint32_t provider_node_index);
+void *rte_ub_ring_get_data_buf_area(struct rte_ub_ring_handle *h,
+				    uint32_t provider_node_index);
 
 /**
  * Send multiple buffers via a TX ring.
  *
- * Each buffer pointer is encoded to {node_index, offset} relative
- * to its owning data ring base, then enqueued into the TX ring.
- *
- * @param queue_id  Global TX queue_id
- * @param bufs      Array of buffer pointers
- * @param nb        Number of buffers to send
+ * @param h         handle from init
+ * @param queue_id  global TX queue_id
+ * @param bufs      array of buffer pointers
+ * @param nb        number of buffers to send
  * @return number of buffers actually sent
  */
-uint16_t rte_ub_ring_send_burst(uint32_t queue_id, void **bufs, uint16_t nb);
+uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h,
+				uint32_t queue_id, void **bufs, uint16_t nb);
 
 /**
  * Receive multiple buffers via an RX ring.
  *
- * Dequeues encoded elements from the RX ring, decodes each
- * {node_index, offset} to a local VA pointer in the owning
- * shm's data ring buffer area.
- *
- * @param queue_id  Global RX queue_id
- * @param bufs      [out] Array for received buffer pointers
- * @param nb        Maximum number to receive
+ * @param h         handle from init
+ * @param queue_id  global RX queue_id
+ * @param bufs      [out] array for received buffer pointers
+ * @param nb        maximum number to receive
  * @return number of buffers actually received
  */
-uint16_t rte_ub_ring_recv_burst(uint32_t queue_id, void **bufs, uint16_t nb);
+uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h,
+				uint32_t queue_id, void **bufs, uint16_t nb);
 
-void rte_ub_ring_fini(void);
+/**
+ * Clean up the entire ub_ring subsystem.
+ */
+void rte_ub_ring_fini(struct rte_ub_ring_handle *h);
 
 #ifdef __cplusplus
 }

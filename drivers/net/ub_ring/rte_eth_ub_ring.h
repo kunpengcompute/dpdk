@@ -5,8 +5,8 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_dev.h>
@@ -16,90 +16,49 @@
 extern "C" {
 #endif
 
-/**
- * Create a provider ethdev (vdev probe wrapper).
- *
- * Builds a devargs string and calls rte_dev_probe().
- * The PMD vdev probe handles the real init.
- * Load PMD with: -d librte_net_ub_ring.so
- */
 static inline int
 rte_eth_ub_ring_create_provider(const char *name,
-	const char **ub_nodes, uint32_t nb_nodes,
-	const char *region, const char *shm_prefix,
-	size_t shm_size, uint32_t nb_queues, uint32_t queue_depth)
+	const char **p_nodes, uint32_t np, const char **u_nodes, uint32_t nu,
+	const char *region, const char *pre,
+	size_t shm_sz, uint32_t nq, uint32_t qd)
 {
-	char devargs[1024];
-	char vdev_name[64];
-	int ret;
-
-	snprintf(vdev_name, sizeof(vdev_name), "net_ub_ring_%s", name);
-
-	/* compact devargs: under 128 bytes for DPDK's limit */
-	char nodes_str[64] = "";
-	for (uint32_t i = 0; i < nb_nodes && strlen(nodes_str) < 50; i++) {
-		if (i > 0) strcat(nodes_str, "|");
-		strncat(nodes_str, ub_nodes[i], 15);
-	}
-
-	snprintf(devargs, sizeof(devargs),
-		"%s,r=pv,ns=%s,n=%u,reg=%s,pre=%s,sz=%zu,nq=%u,qd=%u",
-		vdev_name, nodes_str, nb_nodes, region, shm_prefix,
-		shm_size, nb_queues, queue_depth);
-
-	ret = rte_dev_probe(devargs);
-	if (ret)
-		return -1;
-
-	uint16_t port_id;
-	ret = rte_eth_dev_get_port_by_name(name, &port_id);
-	if (ret)
-		return -1;
-	return port_id;
+	char da[1024], vn[64], pns[64]="", uns[64]="";
+	snprintf(vn,64,"net_ub_ring_%s",name);
+	for (uint32_t i=0; i<np && strlen(pns)<50; i++)
+		{ if(i) strcat(pns,"|"); strncat(pns,p_nodes[i],15); }
+	for (uint32_t i=0; i<nu && strlen(uns)<50; i++)
+		{ if(i) strcat(uns,"|"); strncat(uns,u_nodes[i],15); }
+	snprintf(da,sizeof(da),"%s,r=pv,pn=%s,un=%s,np=%u,nu=%u,reg=%s,pre=%s,sz=%zu,nq=%u,qd=%u",
+		vn,pns,uns,np,nu,region,pre,shm_sz,nq,qd);
+	int ret=rte_dev_probe(da);
+	if (ret) return -1;
+	uint16_t pid; ret=rte_eth_dev_get_port_by_name(name,&pid);
+	return ret?-1:(int)pid;
 }
 
-/**
- * Create a user ethdev (vdev probe wrapper).
- */
 static inline int
 rte_eth_ub_ring_create_user(const char *name,
-	const char **ub_nodes, uint32_t nb_nodes,
-	const char *region, const char *shm_prefix,
-	uint32_t data_elt_size)
+	const char **p_nodes, uint32_t np, const char **u_nodes, uint32_t nu,
+	const char *region, const char *pre, uint32_t elt)
 {
-	char devargs[1024];
-	char vdev_name[64];
-	int ret;
-
-	snprintf(vdev_name, sizeof(vdev_name), "net_ub_ring_%s", name);
-
-	char nodes_str[64] = "";
-	for (uint32_t i = 0; i < nb_nodes && strlen(nodes_str) < 50; i++) {
-		if (i > 0) strcat(nodes_str, "|");
-		strncat(nodes_str, ub_nodes[i], 15);
-	}
-
-	snprintf(devargs, sizeof(devargs),
-		"%s,r=us,ns=%s,n=%u,reg=%s,pre=%s,de=%u",
-		vdev_name, nodes_str, nb_nodes, region, shm_prefix, data_elt_size);
-
-	ret = rte_dev_probe(devargs);
-	if (ret)
-		return -1;
-
-	uint16_t port_id;
-	ret = rte_eth_dev_get_port_by_name(name, &port_id);
-	if (ret)
-		return -1;
-	return port_id;
+	char da[1024], vn[64], pns[64]="", uns[64]="";
+	snprintf(vn,64,"net_ub_ring_%s",name);
+	for (uint32_t i=0; i<np && strlen(pns)<50; i++)
+		{ if(i) strcat(pns,"|"); strncat(pns,p_nodes[i],15); }
+	for (uint32_t i=0; i<nu && strlen(uns)<50; i++)
+		{ if(i) strcat(uns,"|"); strncat(uns,u_nodes[i],15); }
+	snprintf(da,sizeof(da),"%s,r=us,pn=%s,un=%s,np=%u,nu=%u,reg=%s,pre=%s,de=%u",
+		vn,pns,uns,np,nu,region,pre,elt);
+	int ret=rte_dev_probe(da);
+	if (ret) return -1;
+	uint16_t pid; ret=rte_eth_dev_get_port_by_name(name,&pid);
+	return ret?-1:(int)pid;
 }
 
-int
-rte_eth_ub_ring_get_queue_mapping(uint32_t provider_node_index,
-	uint32_t sub_queue, uint32_t *tx_queue_id, uint32_t *rx_queue_id);
+int rte_eth_ub_ring_get_queue_mapping(uint32_t pi, uint32_t sq,
+	uint32_t *tx, uint32_t *rx);
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* RTE_ETH_UB_RING_H */
+#endif
