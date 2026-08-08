@@ -77,6 +77,12 @@ struct rte_ub_ring_handle {
 
 	struct rte_ring **rx_rings;
 	struct rte_ring **tx_rings;
+
+	/* MPMC shadow rings (local memory, created by enable_mpmc) */
+	struct rte_ring **shadow_tx;
+	struct rte_ring **shadow_rx;
+	bool mpmc_enabled;
+
 	uint32_t total_queues;
 
 	uint32_t queue_to_provider[UB_RING_MAX_QUEUES];
@@ -590,6 +596,85 @@ int rte_ub_ring_get_peer_index(struct rte_ub_ring_handle *h, const char *hostnam
 	}
 	return -ENOENT;
 }
+/* ================================================================
+ *  MPMC
+ * ================================================================ */
+
+int
+rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h)
+{
+	if (!h || h->mpmc_enabled)
+		return -EINVAL;
+
+	h->shadow_tx = rte_zmalloc(NULL, h->total_queues *
+		sizeof(struct rte_ring *), 0);
+	h->shadow_rx = rte_zmalloc(NULL, h->total_queues *
+		sizeof(struct rte_ring *), 0);
+	if (!h->shadow_tx || !h->shadow_rx)
+		return -ENOMEM;
+
+	for (uint32_t q = 0; q < h->total_queues; q++) {
+		char name[64];
+		snprintf(name, sizeof(name), "stx_q%u", q);
+		h->shadow_tx[q] = rte_ring_create(name, 1024, rte_socket_id(),
+			RING_F_SC_DEQ);
+		snprintf(name, sizeof(name), "srx_q%u", q);
+		h->shadow_rx[q] = rte_ring_create(name, 1024, rte_socket_id(),
+			RING_F_SC_DEQ);
+		if (!h->shadow_tx[q] || !h->shadow_rx[q])
+			return -ENOMEM;
+	}
+
+	h->mpmc_enabled = true;
+	UB_RING_LOG(INFO, "MPMC enabled: %u shadow queue pairs", h->total_queues);
+	return 0;
+}
+
+uint16_t
+rte_ub_ring_mp_send_burst(struct rte_ub_ring_handle *h,
+			  uint32_t qid, void **bufs, uint16_t nb)
+{
+	if (!h || !h->mpmc_enabled || qid >= h->total_queues)
+		return 0;
+	return (uint16_t)rte_ring_enqueue_burst(h->shadow_tx[qid],
+		(void **)bufs, nb, NULL);
+}
+
+uint16_t
+rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h,
+			  uint32_t qid, void **bufs, uint16_t nb)
+{
+	if (!h || !h->mpmc_enabled || qid >= h->total_queues)
+		return 0;
+	return (uint16_t)rte_ring_dequeue_burst(h->shadow_rx[qid],
+		(void **)bufs, nb, NULL);
+}
+
+void
+rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t qid)
+{
+	if (!h || !h->mpmc_enabled || qid >= h->total_queues)
+		return;
+
+	void *bufs[64];
+	uint16_t n;
+	while ((n = (uint16_t)rte_ring_dequeue_burst(h->shadow_tx[qid],
+		bufs, 64, NULL)) > 0)
+		rte_ub_ring_send_burst(h, qid, bufs, n);
+}
+
+void
+rte_ub_ring_flush_rx(struct rte_ub_ring_handle *h, uint32_t qid)
+{
+	if (!h || !h->mpmc_enabled || qid >= h->total_queues)
+		return;
+
+	void *bufs[64];
+	uint16_t n;
+	while ((n = rte_ub_ring_recv_burst(h, qid, bufs, 64)) > 0)
+		rte_ring_enqueue_burst(h->shadow_rx[qid], (void **)bufs, n, NULL);
+}
+
 void rte_ub_ring_fini(struct rte_ub_ring_handle *h) {
 	if (!h) return;
 	for (uint32_t i = 0; i < UB_RING_MAX_NODES; i++) {
@@ -611,5 +696,15 @@ void rte_ub_ring_fini(struct rte_ub_ring_handle *h) {
 	}
 	ubsmem_destroy_region(h->region_name);
 	ubsmem_finalize();
+	if (h->shadow_tx) {
+		for (uint32_t q = 0; q < h->total_queues; q++)
+			rte_ring_free(h->shadow_tx[q]);
+		rte_free(h->shadow_tx);
+	}
+	if (h->shadow_rx) {
+		for (uint32_t q = 0; q < h->total_queues; q++)
+			rte_ring_free(h->shadow_rx[q]);
+		rte_free(h->shadow_rx);
+	}
 	rte_free(h->rx_rings); rte_free(h->tx_rings); rte_free(h);
 }

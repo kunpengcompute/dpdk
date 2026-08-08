@@ -215,6 +215,40 @@ uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h,
 uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h,
 				uint32_t queue_id, void **bufs, uint16_t nb);
 
+/* ================================================================
+ *  MPMC support (user side — shadow rings for multi-threaded access)
+ * ================================================================ */
+
+/**
+ * Enable MPMC shadow rings for this handle.
+ * Creates local shadow_tx/shadow_rx per queue.
+ */
+int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h);
+
+/**
+ * MPMC send (multi-producer safe): enqueue to shadow_tx[qid].
+ */
+uint16_t rte_ub_ring_mp_send_burst(struct rte_ub_ring_handle *h,
+				   uint32_t qid, void **bufs, uint16_t nb);
+
+/**
+ * MPMC recv (multi-consumer safe): dequeue from shadow_rx[qid].
+ */
+uint16_t rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h,
+				   uint32_t qid, void **bufs, uint16_t nb);
+
+/**
+ * Flush TX: move all from shadow_tx[qid] → real tx_ring[qid].
+ * Single-threaded caller only.
+ */
+void rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t qid);
+
+/**
+ * Flush RX: move all from real rx_ring[qid] → shadow_rx[qid].
+ * Single-threaded caller only.
+ */
+void rte_ub_ring_flush_rx(struct rte_ub_ring_handle *h, uint32_t qid);
+
 /**
  * Clean up the entire ub_ring subsystem.
  */

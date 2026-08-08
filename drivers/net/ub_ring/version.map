@@ -1,9 +1,7 @@
 DPDK_25 {
 	global:
 
-	rte_eth_ub_ring_create_provider;
-	rte_eth_ub_ring_create_user;
-	rte_eth_ub_ring_get_queue_mapping;
+	rte_eth_ub_ring_attach;
 
 	local: *;
 };
