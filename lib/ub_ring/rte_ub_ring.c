@@ -17,7 +17,6 @@
 #include <rte_ring.h>
 
 #include <rte_ub_ring.h>
-#include "rte_ub_bootstrap.h"
 
 /* ---- logging ---- */
 RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, NOTICE);
@@ -61,7 +60,7 @@ ubs_strerror(int rc)
 	}
 }
 
-/* ---- internal context (== rte_ub_ring_handle) ---- */
+/* ---- handle (opaque) ---- */
 
 struct rte_ub_ring_handle {
 	uint32_t nb_nodes;
@@ -105,10 +104,8 @@ cmp_node(const void *a, const void *b)
 {
 	const char *sa = *(const char **)a;
 	const char *sb = *(const char **)b;
-	if (!sa)
-		return sb ? -1 : 0;
-	if (!sb)
-		return 1;
+	if (!sa) return sb ? -1 : 0;
+	if (!sb) return 1;
 	return strcmp(sa, sb);
 }
 
@@ -117,21 +114,16 @@ sync_peer_data_ring(struct rte_ub_ring_handle *h, uint32_t i)
 {
 	if (h->peers[i].data_buf_area)
 		return;
-
 	struct ub_ring_metadata *meta = peer_meta(h, i);
 	if (!meta || !(meta->state & UB_RING_STATE_DATA_RING_READY))
 		return;
-
 	h->peers[i].data_elt_size = meta->data_elt_size;
 	h->peers[i].data_ring = (struct rte_ring *)(
 		(char *)h->peers[i].shm_base +
 		meta->ring_area_offset + meta->ring_area_size);
-
-	size_t idx_ring_sz = rte_ring_get_memsize(meta->data_nb_bufs);
-	h->peers[i].data_buf_area =
-		(char *)h->peers[i].data_ring + idx_ring_sz;
-	h->peers[i].data_buf_end =
-		(char *)h->peers[i].data_buf_area +
+	size_t isz = rte_ring_get_memsize(meta->data_nb_bufs);
+	h->peers[i].data_buf_area = (char *)h->peers[i].data_ring + isz;
+	h->peers[i].data_buf_end  = (char *)h->peers[i].data_buf_area +
 		(size_t)meta->data_nb_bufs * meta->data_elt_size;
 }
 
@@ -146,130 +138,84 @@ find_peer_by_buf(struct rte_ub_ring_handle *h, const void *buf)
 		    (const char *)buf < (const char *)h->peers[i].data_buf_end)
 			return (int)i;
 	}
-	UB_RING_LOG(ERR, "buf %p does not belong to any shm data ring", buf);
+	UB_RING_LOG(ERR, "buf %p not in any data ring", buf);
 	return -1;
 }
 
 /* ---- metadata helpers ---- */
 
-static size_t
-calc_ring_memsize(uint32_t queue_depth)
-{
-	return rte_ring_get_memsize(queue_depth);
-}
-
-static size_t
-calc_metadata_size(uint32_t nb_queues)
-{
-	size_t base = sizeof(struct ub_ring_metadata) +
-		      nb_queues * 2 * sizeof(uint64_t);
-	return RTE_ALIGN(base, UB_RING_METADATA_ALIGN);
-}
-
-static size_t
-calc_ring_area_size(uint32_t nb_queues, size_t ring_memsize)
-{
-	return nb_queues * 2 * ring_memsize;
-}
+static size_t calc_rsz(uint32_t qd) { return rte_ring_get_memsize(qd); }
+static size_t calc_msz(uint32_t nq)
+{ return RTE_ALIGN(sizeof(struct ub_ring_metadata) + nq*2*sizeof(uint64_t), UB_RING_METADATA_ALIGN); }
+static size_t calc_rasz(uint32_t nq, size_t rs) { return nq*2*rs; }
 
 static void
-write_metadata_provider(struct ub_ring_metadata *meta, uint32_t nb_nodes,
-	uint32_t nb_queues, uint32_t node_index, uint32_t queue_depth,
-	uint64_t total_size, uint64_t ring_area_off, uint64_t ring_area_sz,
+write_meta(struct ub_ring_metadata *m, uint32_t nbn, uint32_t nq,
+	uint32_t ni, uint32_t qd, uint64_t ts, uint64_t ro, uint64_t rs,
 	const char *hostname)
 {
-	memset(meta, 0, sizeof(*meta));
-	meta->magic       = UB_RING_MAGIC;
-	meta->version     = UB_RING_VERSION;
-	meta->nb_nodes    = nb_nodes;
-	meta->nb_queues   = nb_queues;
-	meta->node_index  = node_index;
-	meta->queue_depth = queue_depth;
-	meta->state       = 0;
-	meta->data_elt_size    = 0;
-	meta->data_nb_bufs     = 0;
-	meta->total_size       = total_size;
-	meta->ring_area_offset = ring_area_off;
-	meta->ring_area_size   = ring_area_sz;
-	strncpy(meta->node_name, hostname, sizeof(meta->node_name) - 1);
+	memset(m, 0, sizeof(*m));
+	m->magic = UB_RING_MAGIC; m->version = UB_RING_VERSION;
+	m->nb_nodes = nbn; m->nb_queues = nq; m->node_index = ni;
+	m->queue_depth = qd; m->state = 0;
+	m->total_size = ts; m->ring_area_offset = ro; m->ring_area_size = rs;
+	strncpy(m->node_name, hostname, sizeof(m->node_name) - 1);
 }
 
-static int
-wait_meta_ready(struct ub_ring_metadata *meta)
+static int wait_meta(struct ub_ring_metadata *m)
 {
 	for (int i = 0; i < UB_RING_POLL_TIMEOUT_S * 20; i++) {
-		if (meta->magic == UB_RING_MAGIC &&
-		    meta->version == UB_RING_VERSION &&
-		    (meta->state & UB_RING_STATE_META_READY))
-			return 0;
+		if (m->magic == UB_RING_MAGIC && m->version == UB_RING_VERSION &&
+		    (m->state & UB_RING_STATE_META_READY)) return 0;
 		usleep(UB_RING_POLL_INTERVAL_US);
 	}
 	return -1;
 }
 
-/*
- * Merge provider and user node lists, sort alphabetically, find my index.
- */
 static int
 resolve_my_index(const char **p_nodes, uint32_t np,
 		 const char **u_nodes, uint32_t nu,
 		 uint32_t *my_idx, uint32_t *total)
 {
-	char my_hostname[MAX_HOST_NAME_DESC_LENGTH];
-	const char **all;
-	uint32_t k;
-
-	if (gethostname(my_hostname, sizeof(my_hostname)) != 0) {
-		UB_RING_LOG(ERR, "gethostname failed");
-		return -1;
-	}
-
+	char my_host[MAX_HOST_NAME_DESC_LENGTH];
+	if (gethostname(my_host, sizeof(my_host)) != 0) { UB_RING_LOG(ERR, "gethostname"); return -1; }
 	*total = np + nu;
-	all = rte_malloc(NULL, *total * sizeof(char *), 0);
-	if (!all) {
-		UB_RING_LOG(ERR, "malloc for node list failed");
-		return -1;
-	}
-
-	k = 0;
-	for (uint32_t i = 0; i < np; i++)
-		all[k++] = p_nodes[i];
-	for (uint32_t i = 0; i < nu; i++)
-		all[k++] = u_nodes[i];
-
+	const char **all = rte_malloc(NULL, *total * sizeof(char *), 0);
+	if (!all) return -1;
+	uint32_t k = 0;
+	for (uint32_t i = 0; i < np; i++) all[k++] = p_nodes[i];
+	for (uint32_t i = 0; i < nu; i++) all[k++] = u_nodes[i];
 	qsort(all, *total, sizeof(char *), cmp_node);
-
 	for (uint32_t i = 0; i < *total; i++) {
-		if (strcmp(all[i], my_hostname) == 0) {
-			*my_idx = i;
-			rte_free(all);
-			return 0;
-		}
+		if (strcmp(all[i], my_host) == 0) { *my_idx = i; rte_free(all); return 0; }
 	}
-
 	rte_free(all);
-	UB_RING_LOG(ERR, "hostname '%s' not found in node lists", my_hostname);
+	UB_RING_LOG(ERR, "hostname '%s' not in node lists", my_host);
 	return -1;
 }
 
 /*
- * Wait for bootstrap to reach BS_READY state.
+ * Poll ubsmem_shmem_list_lookup until all provider shms are created.
  */
 static int
-wait_bootstrap_ready(void)
+wait_all_provider_shms(const char *prefix, const char **p_nodes, uint32_t np)
 {
+	ubsmem_shmem_desc_t list[64];
 	for (int t = 0; t < UB_RING_POLL_TIMEOUT_S * 20; t++) {
-		struct bootstrap *bs = ub_bootstrap_get();
-
-		ubsmem_shmem_read_lock(BOOTSTRAP_SHM_NAME);
-		int ready = (bs->hdr.magic == BOOTSTRAP_MAGIC &&
-			     bs->hdr.state == BS_READY);
-		ubsmem_shmem_unlock(BOOTSTRAP_SHM_NAME);
-		if (ready)
-			return 0;
+		uint32_t cnt = 64;
+		int rc = ubsmem_shmem_list_lookup(prefix, list, &cnt);
+		if (rc != UBSM_OK) { usleep(UB_RING_POLL_INTERVAL_US); continue; }
+		uint32_t found = 0;
+		for (uint32_t i = 0; i < np; i++) {
+			char expected[128];
+			snprintf(expected, sizeof(expected), "%s_%s", prefix, p_nodes[i]);
+			for (uint32_t k = 0; k < cnt; k++) {
+				if (strcmp(list[k].name, expected) == 0) { found++; break; }
+			}
+		}
+		if (found == np) return 0;
 		usleep(UB_RING_POLL_INTERVAL_US);
 	}
-	UB_RING_LOG(ERR, "timeout waiting for bootstrap READY");
 	return -1;
 }
 
@@ -294,250 +240,139 @@ rte_ub_ring_provider_init(const char **p_nodes, uint32_t np,
 	int rc;
 
 	if (!p_nodes || np == 0 || np > UB_RING_MAX_NODES ||
-	    nu > UB_RING_MAX_NODES ||
-	    !region || !shm_prefix || shm_size == 0 ||
+	    nu > UB_RING_MAX_NODES || !region || !shm_prefix || shm_size == 0 ||
 	    nb_queues == 0 || nb_queues > UB_RING_MAX_QUEUES ||
-	    queue_depth == 0 || !rte_is_power_of_2(queue_depth)) {
-		rte_errno = EINVAL;
-		return NULL;
-	}
+	    queue_depth == 0 || !rte_is_power_of_2(queue_depth))
+		{ rte_errno = EINVAL; return NULL; }
 
 	struct rte_ub_ring_handle *h = rte_zmalloc(NULL, sizeof(*h), 0);
-	if (!h) {
-		UB_RING_LOG(ERR, "failed to allocate handle");
-		return NULL;
-	}
+	if (!h) { UB_RING_LOG(ERR, "alloc handle"); return NULL; }
 	h->role = UB_RING_ROLE_PROVIDER;
 	snprintf(h->region_name, sizeof(h->region_name), "%s", region);
 	snprintf(h->shm_prefix, sizeof(h->shm_prefix), "%s", shm_prefix);
 
-	/* resolve my sorted index */
-	if (resolve_my_index(p_nodes, np, u_nodes, nu,
-			     &my_index, &total) < 0) {
-		UB_RING_LOG(ERR, "failed to resolve node index");
+	if (resolve_my_index(p_nodes, np, u_nodes, nu, &my_index, &total) < 0)
 		goto fail;
-	}
-	h->nb_nodes      = total;
-	h->my_node_index = my_index;
+	h->nb_nodes = total; h->my_node_index = my_index;
 
-	if (gethostname(my_hostname, sizeof(my_hostname)) != 0) {
-		UB_RING_LOG(ERR, "gethostname failed");
-		goto fail;
-	}
+	if (gethostname(my_hostname, sizeof(my_hostname)) != 0) { UB_RING_LOG(ERR, "gethostname"); goto fail; }
 
-	UB_RING_LOG(INFO, "provider init: hostname='%s', idx=%u/%u, "
-		    "nq=%u, qd=%u, shm_sz=%zu",
-		    my_hostname, my_index, total,
-		    nb_queues, queue_depth, shm_size);
+	UB_RING_LOG(INFO, "provider: hostname='%s' idx=%u/%u nq=%u qd=%u sz=%zu",
+		    my_hostname, my_index, total, nb_queues, queue_depth, shm_size);
 
-	/* ubsmem init */
 	rc = ubsmem_init_attributes(&opts);
-	if (rc != UBSM_OK) {
-		UB_RING_LOG(ERR, "ubsmem_init_attributes: %s(%d)",
-			    ubs_strerror(rc), rc);
-		goto fail;
-	}
+	if (rc) { UB_RING_LOG(ERR, "init_attr: %s(%d)", ubs_strerror(rc), rc); goto fail; }
 	rc = ubsmem_initialize(&opts);
-	if (rc != UBSM_OK) {
-		UB_RING_LOG(ERR, "ubsmem_initialize: %s(%d)",
-			    ubs_strerror(rc), rc);
-		goto fail_ubsmem;
-	}
+	if (rc) { UB_RING_LOG(ERR, "init: %s(%d)", ubs_strerror(rc), rc); goto fail_ub; }
 
-	/* create region */
-	memset(&attr, 0, sizeof(attr));
-	attr.host_num = total;
+	memset(&attr, 0, sizeof(attr)); attr.host_num = total;
 	for (uint32_t i = 0; i < np; i++) {
-		strncpy(attr.hosts[i].host_name, p_nodes[i],
-			MAX_HOST_NAME_DESC_LENGTH - 1);
+		strncpy(attr.hosts[i].host_name, p_nodes[i], MAX_HOST_NAME_DESC_LENGTH - 1);
 		attr.hosts[i].affinity = true;
 	}
 	for (uint32_t i = 0; i < nu; i++) {
-		strncpy(attr.hosts[np + i].host_name, u_nodes[i],
-			MAX_HOST_NAME_DESC_LENGTH - 1);
+		strncpy(attr.hosts[np + i].host_name, u_nodes[i], MAX_HOST_NAME_DESC_LENGTH - 1);
 		attr.hosts[np + i].affinity = true;
 	}
 	ubsmem_destroy_region(region);
 	rc = ubsmem_create_region(region, 0, &attr);
-	if (rc != UBSM_OK) {
-		UB_RING_LOG(ERR, "create_region(%s): %s(%d)",
-			    region, ubs_strerror(rc), rc);
-		goto fail_ubsmem;
-	}
-
-	/* bootstrap */
-	rc = ub_bootstrap_init_or_map(region);
-	if (rc < 0) {
-		UB_RING_LOG(ERR, "bootstrap init/map failed");
-		goto fail_region;
-	}
+	if (rc) { UB_RING_LOG(ERR, "region: %s(%d)", ubs_strerror(rc), rc); goto fail_ub; }
 
 	/* create own shm */
-	snprintf(shm_name, sizeof(shm_name), "%s_%s",
-		 shm_prefix, my_hostname);
-
+	snprintf(shm_name, sizeof(shm_name), "%s_%s", shm_prefix, my_hostname);
 	ubsmem_shmem_deallocate(shm_name);
-	uint64_t flags = UBSM_FLAG_NONCACHE | UBSM_FLAG_WR_DELAY_COMP;
-	rc = ubsmem_shmem_allocate(region, shm_name, shm_size, 0600, flags);
-	if (rc != UBSM_OK) {
-		UB_RING_LOG(ERR, "shmem_allocate(%s, %zu): %s(%d)",
-			    shm_name, shm_size, ubs_strerror(rc), rc);
-		goto fail_region;
-	}
-	rc = ubsmem_shmem_map(NULL, shm_size, PROT_READ | PROT_WRITE,
-			      MAP_SHARED, shm_name, 0, &own_shm);
-	if (rc != UBSM_OK) {
-		UB_RING_LOG(ERR, "shmem_map(%s): %s(%d)",
-			    shm_name, ubs_strerror(rc), rc);
-		goto fail_region;
-	}
+	rc = ubsmem_shmem_allocate(region, shm_name, shm_size, 0600,
+		UBSM_FLAG_NONCACHE | UBSM_FLAG_WR_DELAY_COMP);
+	if (rc) { UB_RING_LOG(ERR, "alloc shm: %s(%d)", ubs_strerror(rc), rc); goto fail_reg; }
+	rc = ubsmem_shmem_map(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_name, 0, &own_shm);
+	if (rc) { UB_RING_LOG(ERR, "map shm: %s(%d)", ubs_strerror(rc), rc); goto fail_reg; }
 	memset(own_shm, 0, shm_size);
 	h->peers[my_index].shm_base = own_shm;
 
 	/* init tx/rx rings */
-	meta_size    = calc_metadata_size(nb_queues);
-	ring_memsize = calc_ring_memsize(queue_depth);
-	ring_area_sz = calc_ring_area_size(nb_queues, ring_memsize);
-
-	UB_RING_LOG(INFO, "layout: meta=%zu ring_area=%zu "
-		    "data_ring at 0x%zx size=0x%zx",
-		    meta_size, ring_area_sz,
-		    meta_size + ring_area_sz,
-		    shm_size - meta_size - ring_area_sz);
-
+	meta_size = calc_msz(nb_queues); ring_memsize = calc_rsz(queue_depth);
+	ring_area_sz = calc_rasz(nb_queues, ring_memsize);
 	for (uint32_t q = 0; q < nb_queues; q++) {
-		char rname[32];
-		void *rx_addr = (char *)own_shm + meta_size +
-				q * ring_memsize;
-		void *tx_addr = (char *)own_shm + meta_size +
-				(nb_queues + q) * ring_memsize;
-
-		snprintf(rname, sizeof(rname), "rx_q%u", q);
-		rc = rte_ring_init((struct rte_ring *)rx_addr, rname,
-				   queue_depth,
-				   RING_F_SP_ENQ | RING_F_SC_DEQ);
-		if (rc < 0) {
-			UB_RING_LOG(ERR, "rte_ring_init rx_q%u failed: %d",
-				    q, rc);
-			goto fail_region;
-		}
-
-		snprintf(rname, sizeof(rname), "tx_q%u", q);
-		rc = rte_ring_init((struct rte_ring *)tx_addr, rname,
-				   queue_depth,
-				   RING_F_SP_ENQ | RING_F_SC_DEQ);
-		if (rc < 0) {
-			UB_RING_LOG(ERR, "rte_ring_init tx_q%u failed: %d",
-				    q, rc);
-			goto fail_region;
-		}
+		char rn[32]; void *rx, *tx;
+		rx = (char *)own_shm + meta_size + q * ring_memsize;
+		tx = (char *)own_shm + meta_size + (nb_queues + q) * ring_memsize;
+		snprintf(rn, 32, "rx_q%u", q);
+		rc = rte_ring_init((struct rte_ring *)rx, rn, queue_depth, RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (rc < 0) { UB_RING_LOG(ERR, "rx_q%u: %d", q, rc); goto fail_reg; }
+		snprintf(rn, 32, "tx_q%u", q);
+		rc = rte_ring_init((struct rte_ring *)tx, rn, queue_depth, RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (rc < 0) { UB_RING_LOG(ERR, "tx_q%u: %d", q, rc); goto fail_reg; }
 	}
 
 	/* write metadata */
-	struct ub_ring_metadata *own_meta =
-		(struct ub_ring_metadata *)own_shm;
-	write_metadata_provider(own_meta, total, nb_queues, my_index,
-				queue_depth, shm_size, meta_size,
-				ring_area_sz, my_hostname);
-
+	struct ub_ring_metadata *om = (struct ub_ring_metadata *)own_shm;
+	write_meta(om, total, nb_queues, my_index, queue_depth, shm_size, meta_size, ring_area_sz, my_hostname);
 	for (uint32_t q = 0; q < nb_queues; q++) {
-		own_meta->queue_offsets[q] =
-			meta_size + q * ring_memsize;
-		own_meta->queue_offsets[nb_queues + q] =
-			meta_size + (nb_queues + q) * ring_memsize;
+		om->queue_offsets[q] = meta_size + q * ring_memsize;
+		om->queue_offsets[nb_queues + q] = meta_size + (nb_queues + q) * ring_memsize;
 	}
-	own_meta->state |= UB_RING_STATE_META_READY;
+	om->state |= UB_RING_STATE_META_READY;
 	h->peers[my_index].data_ring = NULL;
 	h->peers[my_index].data_buf_area = NULL;
 
-	/* register in bootstrap (shm first, then provider) */
-	ub_bootstrap_register_shm(shm_name, my_hostname, shm_size);
-	ub_bootstrap_register_provider(my_hostname, np);
+	/* wait for all provider shms to appear */
+	UB_RING_LOG(INFO, "waiting for %u provider shms...", np);
+	if (wait_all_provider_shms(shm_prefix, p_nodes, np) < 0) {
+		UB_RING_LOG(ERR, "timeout waiting for provider shms");
+		goto fail_reg;
+	}
 
-	/* ★ wait for all providers to register → bootstrap READY */
-	UB_RING_LOG(INFO, "waiting for bootstrap READY...");
-	if (wait_bootstrap_ready() < 0)
-		goto fail_region;
-	UB_RING_LOG(INFO, "bootstrap READY, discovering peers");
+	/* discover + map peer shms */
+	for (uint32_t i = 0; i < np; i++) {
+		if (strcmp(p_nodes[i], my_hostname) == 0) continue;
 
-	/* discover peer shms via bootstrap */
-	struct bootstrap *bs = ub_bootstrap_get();
+		char peer_name[128];
+		snprintf(peer_name, sizeof(peer_name), "%s_%s", shm_prefix, p_nodes[i]);
 
-	ubsmem_shmem_read_lock(BOOTSTRAP_SHM_NAME);
-	uint32_t nb_shms = bs->hdr.nb_shms;
-	ubsmem_shmem_unlock(BOOTSTRAP_SHM_NAME);
+		ubsmem_shmem_desc_t list[32]; uint32_t cnt = 32;
+		uint64_t psz = 0;
+		rc = ubsmem_shmem_list_lookup(shm_prefix, list, &cnt);
+		if (rc != UBSM_OK) continue;
+		for (uint32_t k = 0; k < cnt; k++)
+			if (strcmp(list[k].name, peer_name) == 0) { psz = list[k].size; break; }
+		if (!psz) continue;
 
-	for (uint32_t s = 0; s < nb_shms; s++) {
-		ubsmem_shmem_read_lock(BOOTSTRAP_SHM_NAME);
-		int ready = (bs->shms[s].state == SHM_READY);
-		char owner[64], name[64];
-		uint64_t sz;
-		if (ready) {
-			strncpy(owner, bs->shms[s].owner_name, 63);
-			strncpy(name, bs->shms[s].name, 63);
-			sz = bs->shms[s].size;
-		}
-		ubsmem_shmem_unlock(BOOTSTRAP_SHM_NAME);
-		if (!ready || strcmp(owner, my_hostname) == 0)
-			continue;
+		void *ps = NULL;
+		rc = ubsmem_shmem_map(NULL, psz, PROT_READ | PROT_WRITE, MAP_SHARED, peer_name, 0, &ps);
+		if (rc) { UB_RING_LOG(ERR, "map %s: %s(%d)", peer_name, ubs_strerror(rc), rc); goto fail_reg; }
 
-		/* find sorted index for owner */
 		uint32_t pi = UINT32_MAX;
 		for (uint32_t j = 0; j < total; j++) {
 			const char *n = j < np ? p_nodes[j] : u_nodes[j - np];
-			if (strcmp(n, owner) == 0) { pi = j; break; }
+			if (strcmp(n, p_nodes[i]) == 0) { pi = j; break; }
 		}
-		if (pi >= UB_RING_MAX_NODES)
-			continue;
+		if (pi >= UB_RING_MAX_NODES) continue;
 
-		void *peer_shm = NULL;
-		rc = ubsmem_shmem_map(NULL, sz, PROT_READ | PROT_WRITE,
-				      MAP_SHARED, name, 0, &peer_shm);
-		if (rc != UBSM_OK) {
-			UB_RING_LOG(ERR, "shmem_map(%s): %s(%d)",
-				    name, ubs_strerror(rc), rc);
-			goto fail_region;
-		}
-		h->peers[pi].shm_base = peer_shm;
-
-		if (wait_meta_ready((struct ub_ring_metadata *)peer_shm) < 0) {
-			UB_RING_LOG(ERR, "timeout meta_ready on '%s'", name);
-			goto fail_region;
-		}
+		h->peers[pi].shm_base = ps;
+		if (wait_meta((struct ub_ring_metadata *)ps) < 0) {
+			UB_RING_LOG(ERR, "meta timeout %s", peer_name); goto fail_reg; }
 		h->peers[pi].data_ring = NULL;
 		h->peers[pi].data_buf_area = NULL;
-
-		UB_RING_LOG(INFO, "mapped peer shm '%s' (owner=%s, pi=%u)",
-			    name, owner, pi);
+		UB_RING_LOG(INFO, "mapped peer %s (pi=%u)", peer_name, pi);
 	}
 
-	/* set up ring pointers */
+	/* ring pointers */
 	h->total_queues = nb_queues;
 	h->rx_rings = rte_malloc(NULL, nb_queues * sizeof(struct rte_ring *), 0);
 	h->tx_rings = rte_malloc(NULL, nb_queues * sizeof(struct rte_ring *), 0);
-	if (!h->rx_rings || !h->tx_rings) {
-		UB_RING_LOG(ERR, "ring pointer array alloc failed");
-		goto fail_region;
-	}
+	if (!h->rx_rings || !h->tx_rings) goto fail_reg;
 	for (uint32_t q = 0; q < nb_queues; q++) {
-		h->rx_rings[q] = (struct rte_ring *)((char *)own_shm +
-			own_meta->queue_offsets[q]);
-		h->tx_rings[q] = (struct rte_ring *)((char *)own_shm +
-			own_meta->queue_offsets[nb_queues + q]);
+		h->rx_rings[q] = (struct rte_ring *)((char *)own_shm + om->queue_offsets[q]);
+		h->tx_rings[q] = (struct rte_ring *)((char *)own_shm + om->queue_offsets[nb_queues + q]);
 		h->queue_to_provider[q] = my_index;
 	}
 	h->provider_base_qid[my_index] = 0;
 
-	UB_RING_LOG(INFO, "provider init complete");
-	return h;
+	UB_RING_LOG(INFO, "provider init done"); return h;
 
-fail_region:
-	ubsmem_destroy_region(region);
-fail_ubsmem:
-	ubsmem_finalize();
-fail:
-	rte_free(h);
-	return NULL;
+fail_reg: ubsmem_destroy_region(region);
+fail_ub: ubsmem_finalize();
+fail: rte_free(h); return NULL;
 }
 
 /* ================================================================
@@ -557,455 +392,224 @@ rte_ub_ring_user_init(const char **p_nodes, uint32_t np,
 	int rc;
 
 	if (!p_nodes || np == 0 || np > UB_RING_MAX_NODES ||
-	    nu > UB_RING_MAX_NODES ||
-	    !region || !shm_prefix || data_elt_size == 0) {
-		rte_errno = EINVAL;
-		return NULL;
-	}
+	    nu > UB_RING_MAX_NODES || !region || !shm_prefix || data_elt_size == 0)
+		{ rte_errno = EINVAL; return NULL; }
 
 	struct rte_ub_ring_handle *h = rte_zmalloc(NULL, sizeof(*h), 0);
-	if (!h) {
-		UB_RING_LOG(ERR, "failed to allocate handle");
-		return NULL;
-	}
+	if (!h) { UB_RING_LOG(ERR, "alloc handle"); return NULL; }
 	h->role = UB_RING_ROLE_USER;
 	snprintf(h->region_name, sizeof(h->region_name), "%s", region);
 	snprintf(h->shm_prefix, sizeof(h->shm_prefix), "%s", shm_prefix);
 
-	if (resolve_my_index(p_nodes, np, u_nodes, nu,
-			     &my_index, &total) < 0) {
-		UB_RING_LOG(ERR, "failed to resolve node index");
+	if (resolve_my_index(p_nodes, np, u_nodes, nu, &my_index, &total) < 0)
 		goto fail;
-	}
-	h->nb_nodes      = total;
-	h->my_node_index = my_index;
+	h->nb_nodes = total; h->my_node_index = my_index;
 
-	if (gethostname(my_hostname, sizeof(my_hostname)) != 0) {
-		UB_RING_LOG(ERR, "gethostname failed");
-		goto fail;
-	}
+	if (gethostname(my_hostname, sizeof(my_hostname)) != 0) { UB_RING_LOG(ERR, "gethostname"); goto fail; }
 
-	UB_RING_LOG(INFO, "user init: hostname='%s', idx=%u/%u, "
-		    "data_elt_size=%u",
+	UB_RING_LOG(INFO, "user: hostname='%s' idx=%u/%u elt=%u",
 		    my_hostname, my_index, total, data_elt_size);
 
 	rc = ubsmem_init_attributes(&opts);
-	if (rc != UBSM_OK) {
-		UB_RING_LOG(ERR, "ubsmem_init_attributes: %s(%d)",
-			    ubs_strerror(rc), rc);
-		goto fail;
-	}
+	if (rc) { UB_RING_LOG(ERR, "init_attr: %s(%d)", ubs_strerror(rc), rc); goto fail; }
 	rc = ubsmem_initialize(&opts);
-	if (rc != UBSM_OK) {
-		UB_RING_LOG(ERR, "ubsmem_initialize: %s(%d)",
-			    ubs_strerror(rc), rc);
-		goto fail_ubsmem;
-	}
+	if (rc) { UB_RING_LOG(ERR, "init: %s(%d)", ubs_strerror(rc), rc); goto fail_ub; }
 
-	memset(&attr, 0, sizeof(attr));
-	attr.host_num = total;
+	memset(&attr, 0, sizeof(attr)); attr.host_num = total;
 	for (uint32_t i = 0; i < np; i++) {
-		strncpy(attr.hosts[i].host_name, p_nodes[i],
-			MAX_HOST_NAME_DESC_LENGTH - 1);
+		strncpy(attr.hosts[i].host_name, p_nodes[i], MAX_HOST_NAME_DESC_LENGTH - 1);
 		attr.hosts[i].affinity = true;
 	}
 	for (uint32_t i = 0; i < nu; i++) {
-		strncpy(attr.hosts[np + i].host_name, u_nodes[i],
-			MAX_HOST_NAME_DESC_LENGTH - 1);
+		strncpy(attr.hosts[np + i].host_name, u_nodes[i], MAX_HOST_NAME_DESC_LENGTH - 1);
 		attr.hosts[np + i].affinity = true;
 	}
 	ubsmem_destroy_region(region);
 	rc = ubsmem_create_region(region, 0, &attr);
-	if (rc != UBSM_OK) {
-		UB_RING_LOG(ERR, "create_region(%s): %s(%d)",
-			    region, ubs_strerror(rc), rc);
-		goto fail_ubsmem;
+	if (rc) { UB_RING_LOG(ERR, "region: %s(%d)", ubs_strerror(rc), rc); goto fail_ub; }
+
+	/* wait for all provider shms */
+	UB_RING_LOG(INFO, "waiting for %u provider shms...", np);
+	if (wait_all_provider_shms(shm_prefix, p_nodes, np) < 0) {
+		UB_RING_LOG(ERR, "timeout waiting for provider shms");
+		goto fail_reg;
 	}
 
-	/* map bootstrap (user does not register) */
-	rc = ub_bootstrap_init_or_map(region);
-	if (rc < 0) {
-		UB_RING_LOG(ERR, "bootstrap init/map failed");
-		goto fail_region;
-	}
+	/* discover + map provider shms + init data rings */
+	uint32_t nb_prov = 0, pi_arr[UB_RING_MAX_NODES], pq_arr[UB_RING_MAX_NODES];
 
-	/* wait for all providers to register → bootstrap READY */
-	UB_RING_LOG(INFO, "waiting for bootstrap READY...");
-	if (wait_bootstrap_ready() < 0)
-		goto fail_region;
-	UB_RING_LOG(INFO, "bootstrap READY, discovering providers");
+	for (uint32_t i = 0; i < np; i++) {
+		if (strcmp(p_nodes[i], my_hostname) == 0) continue;
 
-	/* discover + map all provider shms + init data rings */
-	struct bootstrap *bs = ub_bootstrap_get();
-	uint32_t nb_providers = 0;
-	uint32_t provider_indices[UB_RING_MAX_NODES];
-	uint32_t provider_nb_queues[UB_RING_MAX_NODES];
+		char peer_name[128];
+		snprintf(peer_name, sizeof(peer_name), "%s_%s", shm_prefix, p_nodes[i]);
 
-	ubsmem_shmem_read_lock(BOOTSTRAP_SHM_NAME);
-	uint32_t nb_shms = bs->hdr.nb_shms;
-	ubsmem_shmem_unlock(BOOTSTRAP_SHM_NAME);
+		ubsmem_shmem_desc_t list[32]; uint32_t cnt = 32;
+		uint64_t psz = 0;
+		rc = ubsmem_shmem_list_lookup(shm_prefix, list, &cnt);
+		if (rc != UBSM_OK) continue;
+		for (uint32_t k = 0; k < cnt; k++)
+			if (strcmp(list[k].name, peer_name) == 0) { psz = list[k].size; break; }
+		if (!psz) continue;
 
-	for (uint32_t s = 0; s < nb_shms; s++) {
-		ubsmem_shmem_read_lock(BOOTSTRAP_SHM_NAME);
-		int rdy = (bs->shms[s].state == SHM_READY);
-		char owner[64], name[64];
-		uint64_t sz;
-		if (rdy) {
-			strncpy(owner, bs->shms[s].owner_name, 63);
-			strncpy(name, bs->shms[s].name, 63);
-			sz = bs->shms[s].size;
-		}
-		ubsmem_shmem_unlock(BOOTSTRAP_SHM_NAME);
-		if (!rdy || strcmp(owner, my_hostname) == 0)
-			continue;
+		void *ps = NULL;
+		rc = ubsmem_shmem_map(NULL, psz, PROT_READ | PROT_WRITE, MAP_SHARED, peer_name, 0, &ps);
+		if (rc) { UB_RING_LOG(ERR, "map %s: %s(%d)", peer_name, ubs_strerror(rc), rc); goto fail_reg; }
 
 		uint32_t pi = UINT32_MAX;
 		for (uint32_t j = 0; j < total; j++) {
 			const char *n = j < np ? p_nodes[j] : u_nodes[j - np];
-			if (strcmp(n, owner) == 0) { pi = j; break; }
+			if (strcmp(n, p_nodes[i]) == 0) { pi = j; break; }
 		}
-		if (pi >= UB_RING_MAX_NODES)
-			continue;
+		if (pi >= UB_RING_MAX_NODES) continue;
 
-		void *peer_shm = NULL;
-		rc = ubsmem_shmem_map(NULL, sz, PROT_READ | PROT_WRITE,
-				      MAP_SHARED, name, 0, &peer_shm);
-		if (rc != UBSM_OK) {
-			UB_RING_LOG(ERR, "shmem_map(%s): %s(%d)",
-				    name, ubs_strerror(rc), rc);
-			goto fail_region;
-		}
-		h->peers[pi].shm_base = peer_shm;
-
-		struct ub_ring_metadata *peer_meta =
-			(struct ub_ring_metadata *)peer_shm;
-		if (wait_meta_ready(peer_meta) < 0) {
-			UB_RING_LOG(ERR, "timeout meta_ready on '%s'", name);
-			goto fail_region;
-		}
+		h->peers[pi].shm_base = ps;
+		struct ub_ring_metadata *pm = (struct ub_ring_metadata *)ps;
+		if (wait_meta(pm) < 0) { UB_RING_LOG(ERR, "meta timeout %s", peer_name); goto fail_reg; }
 		h->peers[pi].data_elt_size = data_elt_size;
 
-		uint64_t dr_off = peer_meta->ring_area_offset +
-				  peer_meta->ring_area_size;
-		uint64_t dr_sz  = peer_meta->total_size - dr_off;
-		uint32_t max_idx = (uint32_t)((dr_sz - sizeof(struct rte_ring)) /
-					      (8 + data_elt_size));
-		max_idx = rte_align32prevpow2(max_idx);
-		while (rte_ring_get_memsize(max_idx) +
-		       (size_t)max_idx * data_elt_size > dr_sz)
-			max_idx /= 2;
-		if (max_idx < 2) {
-			UB_RING_LOG(ERR, "data ring area too small "
-				    "for elt_size=%u", data_elt_size);
-			goto fail_region;
+		uint64_t dr_off = pm->ring_area_offset + pm->ring_area_size;
+		uint64_t dr_sz  = pm->total_size - dr_off;
+		uint32_t mx = (uint32_t)((dr_sz - sizeof(struct rte_ring)) / (8 + data_elt_size));
+		mx = rte_align32prevpow2(mx);
+		while (rte_ring_get_memsize(mx) + (size_t)mx * data_elt_size > dr_sz) mx /= 2;
+		if (mx < 2) { UB_RING_LOG(ERR, "data ring too small"); goto fail_reg; }
+
+		size_t irs = rte_ring_get_memsize(mx);
+		void *dr = (char *)ps + dr_off;
+		struct rte_ring *ir = (struct rte_ring *)dr;
+		char rn[64]; snprintf(rn, 64, "data_%s", peer_name);
+		rc = rte_ring_init(ir, rn, mx, RING_F_SC_DEQ);
+		if (rc < 0) { UB_RING_LOG(ERR, "data_ring: %d", rc); goto fail_reg; }
+		void *ba = (char *)dr + irs;
+
+		for (uint32_t idx = 0; idx < mx; idx++) {
+			void *e = (void *)(uintptr_t)(idx * data_elt_size);
+			rte_ring_enqueue_burst(ir, &e, 1, NULL);
 		}
-
-		size_t idx_ring_memsize = rte_ring_get_memsize(max_idx);
-		void *dr_base = (char *)peer_shm + dr_off;
-		struct rte_ring *idx_ring = (struct rte_ring *)dr_base;
-		char rname[64];
-		snprintf(rname, sizeof(rname), "data_ring_%s", name);
-
-		rc = rte_ring_init(idx_ring, rname, max_idx, RING_F_SC_DEQ);
-		if (rc < 0) {
-			UB_RING_LOG(ERR, "rte_ring_init data_ring failed: %d",
-				    rc);
-			goto fail_region;
-		}
-
-		void *buf_area = (char *)dr_base + idx_ring_memsize;
-
-		for (uint32_t idx = 0; idx < max_idx; idx++) {
-			void *elem = (void *)(uintptr_t)(idx * data_elt_size);
-			rte_ring_enqueue_burst(idx_ring, &elem, 1, NULL);
-		}
-
-		h->peers[pi].data_ring     = idx_ring;
-		h->peers[pi].data_buf_area = buf_area;
-		h->peers[pi].data_buf_end  = (char *)buf_area +
-			(size_t)max_idx * data_elt_size;
-
-		peer_meta->data_elt_size = data_elt_size;
-		peer_meta->data_nb_bufs  = max_idx;
-		peer_meta->state |= UB_RING_STATE_DATA_RING_READY;
-
-		provider_indices[nb_providers]  = pi;
-		provider_nb_queues[nb_providers] = peer_meta->nb_queues;
-		nb_providers++;
-
-		UB_RING_LOG(INFO, "data ring '%s': nb_bufs=%u, elt_size=%u, "
-			    "idx_ring=%zu bytes",
-			    name, max_idx, data_elt_size, idx_ring_memsize);
+		h->peers[pi].data_ring = ir;
+		h->peers[pi].data_buf_area = ba;
+		h->peers[pi].data_buf_end  = (char *)ba + (size_t)mx * data_elt_size;
+		pm->data_elt_size = data_elt_size; pm->data_nb_bufs = mx;
+		pm->state |= UB_RING_STATE_DATA_RING_READY;
+		pi_arr[nb_prov] = pi; pq_arr[nb_prov] = pm->nb_queues; nb_prov++;
+		UB_RING_LOG(INFO, "data ring %s: %u bufs", peer_name, mx);
 	}
 
 	h->peers[my_index].data_ring = NULL;
 	h->peers[my_index].data_buf_area = NULL;
 
-	/* collect ring pointers */
-	uint32_t total_q = 0;
-	for (uint32_t p = 0; p < nb_providers; p++)
-		total_q += provider_nb_queues[p];
-	h->total_queues = total_q;
-	h->rx_rings = rte_malloc(NULL, total_q * sizeof(struct rte_ring *), 0);
-	h->tx_rings = rte_malloc(NULL, total_q * sizeof(struct rte_ring *), 0);
-	if (!h->rx_rings || !h->tx_rings) {
-		UB_RING_LOG(ERR, "ring pointer array alloc failed");
-		goto fail_region;
-	}
+	uint32_t tq = 0;
+	for (uint32_t p = 0; p < nb_prov; p++) tq += pq_arr[p];
+	h->total_queues = tq;
+	h->rx_rings = rte_malloc(NULL, tq * sizeof(struct rte_ring *), 0);
+	h->tx_rings = rte_malloc(NULL, tq * sizeof(struct rte_ring *), 0);
+	if (!h->rx_rings || !h->tx_rings) goto fail_reg;
 
 	uint32_t idx = 0;
-	for (uint32_t p = 0; p < nb_providers; p++) {
-		uint32_t pi = provider_indices[p];
-		uint32_t nq = provider_nb_queues[p];
+	for (uint32_t p = 0; p < nb_prov; p++) {
+		uint32_t pi = pi_arr[p], nq = pq_arr[p];
 		h->provider_base_qid[pi] = idx;
 		struct ub_ring_metadata *m = peer_meta(h, pi);
 		void *sh = h->peers[pi].shm_base;
 		for (uint32_t q = 0; q < nq; q++) {
-			/* crossed: provider rx → user tx, provider tx → user rx */
-			h->tx_rings[idx] = (struct rte_ring *)((char *)sh +
-				m->queue_offsets[q]);
-			h->rx_rings[idx] = (struct rte_ring *)((char *)sh +
-				m->queue_offsets[nq + q]);
-			h->queue_to_provider[idx] = pi;
-			idx++;
+			h->tx_rings[idx] = (struct rte_ring *)((char *)sh + m->queue_offsets[q]);
+			h->rx_rings[idx] = (struct rte_ring *)((char *)sh + m->queue_offsets[nq + q]);
+			h->queue_to_provider[idx] = pi; idx++;
 		}
 	}
+	UB_RING_LOG(INFO, "user init done: %u queues", tq); return h;
 
-	UB_RING_LOG(INFO, "user init complete: total_queues=%u, "
-		    "nb_providers=%u", total_q, nb_providers);
-	return h;
-
-fail_region:
-	ubsmem_destroy_region(region);
-fail_ubsmem:
-	ubsmem_finalize();
-fail:
-	rte_free(h);
-	return NULL;
+fail_reg: ubsmem_destroy_region(region);
+fail_ub: ubsmem_finalize();
+fail: rte_free(h); return NULL;
 }
 
-/* ================================================================
- *  Buffer Alloc / Free
- * ================================================================ */
-
-void *
-rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h,
-		      uint32_t provider_node_index)
-{
-	if (!h || provider_node_index >= UB_RING_MAX_NODES)
-		return NULL;
-
-	sync_peer_data_ring(h, provider_node_index);
-	struct rte_ring *dr = h->peers[provider_node_index].data_ring;
-	if (!dr)
-		return NULL;
-
-	void *elem;
-	if (rte_ring_sc_dequeue_bulk(dr, &elem, 1, NULL) == 0)
-		return NULL;
-
-	return (char *)h->peers[provider_node_index].data_buf_area +
-	       (size_t)(uintptr_t)elem;
+/* ---- Alloc/Free/Send/Recv/Queue/Fini unchanged ---- */
+void *rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h, uint32_t pi) {
+	if (!h || pi >= UB_RING_MAX_NODES) return NULL;
+	sync_peer_data_ring(h, pi);
+	struct rte_ring *dr = h->peers[pi].data_ring; if (!dr) return NULL;
+	void *e; if (rte_ring_sc_dequeue_bulk(dr, &e, 1, NULL) == 0) return NULL;
+	return (char *)h->peers[pi].data_buf_area + (size_t)(uintptr_t)e;
 }
-
-void
-rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
-{
-	if (!h || !buf)
-		return;
-
-	int ni = find_peer_by_buf(h, buf);
-	if (ni < 0)
-		return;
-	struct rte_ring *dr = h->peers[ni].data_ring;
-	if (!dr)
-		return;
-
-	void *elem = (void *)(uintptr_t)((char *)buf -
-		(char *)h->peers[ni].data_buf_area);
-
-	rte_ring_mp_enqueue_bulk(dr, &elem, 1, NULL);
+void rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf) {
+	if (!h || !buf) return;
+	int ni = find_peer_by_buf(h, buf); if (ni < 0) return;
+	struct rte_ring *dr = h->peers[ni].data_ring; if (!dr) return;
+	void *e = (void *)(uintptr_t)((char *)buf - (char *)h->peers[ni].data_buf_area);
+	rte_ring_mp_enqueue_bulk(dr, &e, 1, NULL);
 }
-
-uint32_t
-rte_ub_ring_get_data_elt_size(struct rte_ub_ring_handle *h,
-			      uint32_t provider_node_index)
-{
-	if (!h || provider_node_index >= UB_RING_MAX_NODES)
-		return 0;
-	sync_peer_data_ring(h, provider_node_index);
-	return h->peers[provider_node_index].data_elt_size;
+uint32_t rte_ub_ring_get_data_elt_size(struct rte_ub_ring_handle *h, uint32_t pi) {
+	if (!h || pi >= UB_RING_MAX_NODES) return 0;
+	sync_peer_data_ring(h, pi); return h->peers[pi].data_elt_size;
 }
-
-void *
-rte_ub_ring_get_data_buf_area(struct rte_ub_ring_handle *h,
-			      uint32_t provider_node_index)
-{
-	if (!h || provider_node_index >= UB_RING_MAX_NODES)
-		return NULL;
-	return h->peers[provider_node_index].data_buf_area;
+void *rte_ub_ring_get_data_buf_area(struct rte_ub_ring_handle *h, uint32_t pi) {
+	if (!h || pi >= UB_RING_MAX_NODES) return NULL;
+	return h->peers[pi].data_buf_area;
 }
-
-/* ================================================================
- *  Send / Recv Burst
- * ================================================================ */
-
-uint16_t
-rte_ub_ring_send_burst(struct rte_ub_ring_handle *h,
-		       uint32_t queue_id, void **bufs, uint16_t nb)
-{
-	if (!h || queue_id >= h->total_queues || !bufs || nb == 0)
-		return 0;
-
-	void *elems[nb];
-	uint16_t count = 0;
-
+uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h, uint32_t qid, void **bufs, uint16_t nb) {
+	if (!h || qid >= h->total_queues || !bufs || nb == 0) return 0;
+	void *elems[nb]; uint16_t c = 0;
 	for (uint16_t i = 0; i < nb; i++) {
-		if (!bufs[i])
-			continue;
-		int ni = find_peer_by_buf(h, bufs[i]);
-		if (ni < 0)
-			continue;
-		uint64_t off = (uint64_t)((char *)bufs[i] -
-			(char *)h->peers[ni].data_buf_area);
-		elems[count++] = ub_ring_elem_pack((uint8_t)ni, off);
+		if (!bufs[i]) continue;
+		int ni = find_peer_by_buf(h, bufs[i]); if (ni < 0) continue;
+		uint64_t off = (uint64_t)((char *)bufs[i] - (char *)h->peers[ni].data_buf_area);
+		elems[c++] = ub_ring_elem_pack((uint8_t)ni, off);
 	}
-
-	return (uint16_t)rte_ring_enqueue_burst(h->tx_rings[queue_id],
-						 elems, count, NULL);
+	return (uint16_t)rte_ring_enqueue_burst(h->tx_rings[qid], elems, c, NULL);
 }
-
-uint16_t
-rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h,
-		       uint32_t queue_id, void **bufs, uint16_t nb)
-{
-	if (!h || queue_id >= h->total_queues || !bufs || nb == 0)
-		return 0;
-
+uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h, uint32_t qid, void **bufs, uint16_t nb) {
+	if (!h || qid >= h->total_queues || !bufs || nb == 0) return 0;
 	void *elems[nb];
-	uint16_t n = (uint16_t)rte_ring_dequeue_burst(
-		h->rx_rings[queue_id], elems, nb, NULL);
-
+	uint16_t n = (uint16_t)rte_ring_dequeue_burst(h->rx_rings[qid], elems, nb, NULL);
 	for (uint16_t i = 0; i < n; i++) {
-		uint8_t  ni  = ub_ring_elem_get_node(elems[i]);
+		uint8_t ni = ub_ring_elem_get_node(elems[i]);
 		uint64_t off = ub_ring_elem_get_offset(elems[i]);
 		sync_peer_data_ring(h, ni);
 		bufs[i] = (char *)h->peers[ni].data_buf_area + off;
 	}
-
 	return n;
 }
-
-/* ================================================================
- *  Queue Mapping
- * ================================================================ */
-
-int
-rte_ub_ring_get_queue_mapping(struct rte_ub_ring_handle *h,
-			      uint32_t provider_node_index,
-			      uint32_t sub_queue,
-			      uint32_t *tx_queue_id, uint32_t *rx_queue_id)
-{
-	if (!h || !tx_queue_id || !rx_queue_id)
-		return -EINVAL;
-	struct ub_ring_metadata *m = peer_meta(h, provider_node_index);
-	if (!m || sub_queue >= m->nb_queues)
-		return -EINVAL;
-
-	uint32_t qid = h->provider_base_qid[provider_node_index] + sub_queue;
-	*tx_queue_id = qid;
-	*rx_queue_id = qid;
-	return 0;
+int rte_ub_ring_get_queue_mapping(struct rte_ub_ring_handle *h, uint32_t pi, uint32_t sq, uint32_t *tx, uint32_t *rx) {
+	if (!h || !tx || !rx) return -EINVAL;
+	struct ub_ring_metadata *m = peer_meta(h, pi);
+	if (!m || sq >= m->nb_queues) return -EINVAL;
+	uint32_t q = h->provider_base_qid[pi] + sq; *tx = q; *rx = q; return 0;
 }
-
-uint32_t
-rte_ub_ring_queue_to_provider(struct rte_ub_ring_handle *h,
-			      uint32_t queue_id)
-{
-	if (!h || queue_id >= h->total_queues)
-		return 0;
-	return h->queue_to_provider[queue_id];
-}
-
-uint32_t
-rte_ub_ring_get_total_queues(struct rte_ub_ring_handle *h)
-{
-	return h ? h->total_queues : 0;
-}
-
-int
-rte_ub_ring_get_node_index(struct rte_ub_ring_handle *h, uint32_t *idx)
-{
-	if (!h || !idx)
-		return -EINVAL;
-	*idx = h->my_node_index;
-	return 0;
-}
-
-int
-rte_ub_ring_get_peer_index(struct rte_ub_ring_handle *h,
-			   const char *hostname, uint32_t *idx)
-{
-	if (!h || !hostname || !idx)
-		return -EINVAL;
+uint32_t rte_ub_ring_queue_to_provider(struct rte_ub_ring_handle *h, uint32_t qid)
+{ return (!h || qid >= h->total_queues) ? 0 : h->queue_to_provider[qid]; }
+uint32_t rte_ub_ring_get_total_queues(struct rte_ub_ring_handle *h) { return h ? h->total_queues : 0; }
+int rte_ub_ring_get_node_index(struct rte_ub_ring_handle *h, uint32_t *idx)
+{ if (!h || !idx) return -EINVAL; *idx = h->my_node_index; return 0; }
+int rte_ub_ring_get_peer_index(struct rte_ub_ring_handle *h, const char *hostname, uint32_t *idx) {
+	if (!h || !hostname || !idx) return -EINVAL;
 	for (uint32_t i = 0; i < h->nb_nodes; i++) {
-		if (!peer_meta(h, i))
-			continue;
-		if (strcmp(peer_meta(h, i)->node_name, hostname) == 0) {
-			*idx = i;
-			return 0;
-		}
+		if (!peer_meta(h, i)) continue;
+		if (strcmp(peer_meta(h, i)->node_name, hostname) == 0) { *idx = i; return 0; }
 	}
 	return -ENOENT;
 }
-
-/* ================================================================
- *  Fini
- * ================================================================ */
-
-void
-rte_ub_ring_fini(struct rte_ub_ring_handle *h)
-{
-	if (!h)
-		return;
-
-	UB_RING_LOG(INFO, "cleaning up...");
-
+void rte_ub_ring_fini(struct rte_ub_ring_handle *h) {
+	if (!h) return;
 	for (uint32_t i = 0; i < UB_RING_MAX_NODES; i++) {
-		if (i == h->my_node_index)
-			continue;
+		if (i == h->my_node_index) continue;
 		if (h->peers[i].shm_base) {
-			size_t sz = peer_meta(h, i) ?
-				peer_meta(h, i)->total_size : 0;
+			size_t sz = peer_meta(h, i) ? peer_meta(h, i)->total_size : 0;
 			ubsmem_shmem_unmap(h->peers[i].shm_base, sz);
 			h->peers[i].shm_base = NULL;
 		}
 	}
-
-	if (h->role == UB_RING_ROLE_PROVIDER &&
-	    h->peers[h->my_node_index].shm_base) {
+	if (h->role == UB_RING_ROLE_PROVIDER && h->peers[h->my_node_index].shm_base) {
 		ubsmem_shmem_unmap(h->peers[h->my_node_index].shm_base,
-				   peer_meta(h, h->my_node_index)->total_size);
-		h->peers[h->my_node_index].shm_base = NULL;
-
-		char shm_name[128];
-		char my_hostname[MAX_HOST_NAME_DESC_LENGTH];
-		if (gethostname(my_hostname, sizeof(my_hostname)) == 0) {
-			snprintf(shm_name, sizeof(shm_name), "%s_%s",
-				 h->shm_prefix, my_hostname);
-			ubsmem_shmem_deallocate(shm_name);
+			peer_meta(h, h->my_node_index)->total_size);
+		char nm[128], my_host[MAX_HOST_NAME_DESC_LENGTH];
+		if (gethostname(my_host, sizeof(my_host)) == 0) {
+			snprintf(nm, 128, "%s_%s", h->shm_prefix, my_host);
+			ubsmem_shmem_deallocate(nm);
 		}
 	}
-
-	struct bootstrap *bs = ub_bootstrap_get();
-	if (bs)
-		ubsmem_shmem_unmap(bs, sizeof(*bs));
-
 	ubsmem_destroy_region(h->region_name);
 	ubsmem_finalize();
-
-	rte_free(h->rx_rings);
-	rte_free(h->tx_rings);
-	rte_free(h);
-	UB_RING_LOG(INFO, "cleanup complete");
+	rte_free(h->rx_rings); rte_free(h->tx_rings); rte_free(h);
 }
