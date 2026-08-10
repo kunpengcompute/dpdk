@@ -190,7 +190,7 @@ rte_ub_ring_provider_init(const char **pn, uint32_t np, const char **un, uint32_
 	memset(&a,0,sizeof(a));a.host_num=tot;
 	for(uint32_t i=0;i<np;i++){strncpy(a.hosts[i].host_name,pn[i],MAX_HOST_NAME_DESC_LENGTH-1);a.hosts[i].affinity=true;}
 	for(uint32_t i=0;i<nu;i++){strncpy(a.hosts[np+i].host_name,un[i],MAX_HOST_NAME_DESC_LENGTH-1);a.hosts[np+i].affinity=true;}
-	ubsmem_destroy_region(reg);if((rc=ubsmem_create_region(reg,0,&a))){UB_RING_LOG(ERR,"region:%s(%d)",ubs_strerror(rc),rc);goto fail_ub;}
+	rc=ubsmem_create_region(reg,0,&a);if(rc!=UBSM_OK&&rc!=UBSM_ERR_ALREADY_EXIST){UB_RING_LOG(ERR,"region:%s(%d)",ubs_strerror(rc),rc);goto fail_ub;}
 	snprintf(nm,128,"%s_%s",pre,my); ubsmem_shmem_deallocate(nm);
 	if((rc=ubsmem_shmem_allocate(reg,nm,sz,0600,UBSM_FLAG_NONCACHE|UBSM_FLAG_WR_DELAY_COMP))){UB_RING_LOG(ERR,"alloc:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
 	if((rc=ubsmem_shmem_map(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,nm,0,&sh))){UB_RING_LOG(ERR,"map:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
@@ -244,7 +244,7 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 	memset(&a,0,sizeof(a));a.host_num=tot;
 	for(uint32_t i=0;i<np;i++){strncpy(a.hosts[i].host_name,pn[i],MAX_HOST_NAME_DESC_LENGTH-1);a.hosts[i].affinity=true;}
 	for(uint32_t i=0;i<nu;i++){strncpy(a.hosts[np+i].host_name,un[i],MAX_HOST_NAME_DESC_LENGTH-1);a.hosts[np+i].affinity=true;}
-	ubsmem_destroy_region(reg);if((rc=ubsmem_create_region(reg,0,&a))){UB_RING_LOG(ERR,"region:%s(%d)",ubs_strerror(rc),rc);goto fail_ub;}
+	rc=ubsmem_create_region(reg,0,&a);if(rc!=UBSM_OK&&rc!=UBSM_ERR_ALREADY_EXIST){UB_RING_LOG(ERR,"region:%s(%d)",ubs_strerror(rc),rc);goto fail_ub;}
 	UB_RING_LOG(INFO,"waiting for %u provider shms...",np);
 	if (wait_shms(pre,pn,np)<0){UB_RING_LOG(ERR,"timeout");goto fail_reg;}
 
