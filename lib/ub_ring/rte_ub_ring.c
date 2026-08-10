@@ -249,7 +249,7 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 	if (wait_shms(pre,pn,np)<0){UB_RING_LOG(ERR,"timeout");goto fail_reg;}
 
 	/* create local data rings (one per provider) */
-	h->data_rings = rte_zmalloc(NULL, np*sizeof(void*), 0);
+	h->data_rings = rte_zmalloc(NULL, UB_RING_MAX_NODES*sizeof(void*), 0);
 	if (!h->data_rings) goto fail_reg;
 
 	uint32_t nb_prov=0, pi_arr[UB_RING_MAX_NODES], pq_arr[UB_RING_MAX_NODES];
@@ -405,7 +405,7 @@ void rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 	void *bufs[64]; uint16_t n;
 	while ((n = (uint16_t)rte_ring_dequeue_burst(h->shadow_tx[q], (void**)bufs, 64, NULL)) > 0)
 		rte_ub_ring_send_burst(h, q, bufs, n);
-} }
+}
 void rte_ub_ring_flush_rx(struct rte_ub_ring_handle *h, uint32_t q) {
 	if (!h || !h->mpmc_enabled || q >= h->total_queues) return;
 	void *bufs[64]; uint16_t n;
