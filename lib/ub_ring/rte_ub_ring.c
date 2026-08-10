@@ -303,7 +303,7 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 	uint32_t tq=0;for(uint32_t p=0;p<nb_prov;p++)tq+=pq_arr[p];
 	h->total_queues=tq;
 	h->rx_rings=rte_malloc(NULL,tq*sizeof(void*),0);h->tx_rings=rte_malloc(NULL,tq*sizeof(void*),0);
-	if(!h->rx_rings||!h->tx_rings){UB_RING_LOG(ERR,"ring arrays NULL (total_q=%u)",total_q);goto fail_reg;}
+	if(!h->rx_rings||!h->tx_rings){UB_RING_LOG(ERR,"ring arrays NULL (tq=%u)",tq);goto fail_reg;}
 	uint32_t idx=0;
 	for(uint32_t p=0;p<nb_prov;p++){uint32_t pi=pi_arr[p],nq=pq_arr[p];h->provider_base_qid[pi]=idx;
 		struct ub_ring_metadata*m=peer_meta(h,pi);void*sh=h->peers[pi].shm_base;
