@@ -18,7 +18,7 @@
 #include <rte_ub_ring.h>
 #include <rte_eth_ub_ring.h>
 
-RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, NOTICE);
+RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 #define RTE_LOGTYPE_UB_RING_ETH ub_ring_eth_logtype
 #define UB_RING_ETH_LOG(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, UB_RING_ETH, "%s(): ", __func__, __VA_ARGS__)

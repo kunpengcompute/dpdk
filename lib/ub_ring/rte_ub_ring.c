@@ -217,7 +217,7 @@ rte_ub_ring_provider_init(const char **pn, uint32_t np, const char **un, uint32_
 		UB_RING_LOG(INFO,"peer %s (pi=%u)",pn2,pi);
 	}
 	h->total_queues=nq; h->rx_rings=rte_malloc(NULL,nq*sizeof(void*),0); h->tx_rings=rte_malloc(NULL,nq*sizeof(void*),0);
-	if(!h->rx_rings||!h->tx_rings){UB_RING_LOG(ERR,"ring arrays NULL (total_q=%u)",total_q);goto fail_reg;}
+	if(!h->rx_rings||!h->tx_rings){UB_RING_LOG(ERR,"ring arrays NULL (nq=%u)",nq);goto fail_reg;}
 	for(uint32_t q=0;q<nq;q++){h->rx_rings[q]=(void*)((char*)sh+om->queue_offsets[q]);h->tx_rings[q]=(void*)((char*)sh+om->queue_offsets[nq+q]);h->queue_to_provider[q]=mi;}
 	h->provider_base_qid[mi]=0; UB_RING_LOG(INFO,"provider done"); return h;
 fail_reg: ubsmem_destroy_region(reg);
