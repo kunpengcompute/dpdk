@@ -18,7 +18,7 @@
 
 #include <rte_ub_ring.h>
 
-RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, NOTICE);
+RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, INFO);
 #define RTE_LOGTYPE_UB_RING ub_ring_logtype
 #define UB_RING_LOG(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, UB_RING, "%s(): ", __func__, __VA_ARGS__)
