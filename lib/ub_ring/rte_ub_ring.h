@@ -208,6 +208,17 @@ uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h,
 				uint32_t queue_id, void **bufs, uint16_t nb);
 
 /**
+ * Send burst with explicit per-buffer provider index.
+ * Caller knows each buffer's owning pool (from alloc_buf) — avoids
+ * the peer scan in the hot path.
+ *
+ * @param pi  array of provider node_index, one per buffer
+ */
+uint16_t rte_ub_ring_send_burst_pi(struct rte_ub_ring_handle *h,
+				   uint32_t queue_id, const uint32_t *pi,
+				   void **bufs, uint16_t nb);
+
+/**
  * Receive multiple buffers via an RX ring.
  *
  * @param h         handle from init
@@ -235,6 +246,13 @@ bool rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h);
  */
 uint16_t rte_ub_ring_mp_send_burst(struct rte_ub_ring_handle *h,
 				   uint32_t qid, void **bufs, uint16_t nb);
+
+/**
+ * MPMC send with explicit per-buffer provider index (hot-path variant).
+ */
+uint16_t rte_ub_ring_mp_send_burst_pi(struct rte_ub_ring_handle *h,
+				      uint32_t qid, const uint32_t *pi,
+				      void **bufs, uint16_t nb);
 
 /**
  * MPMC recv (multi-consumer safe): dequeue from shadow_rx[qid].

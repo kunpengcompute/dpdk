@@ -43,17 +43,44 @@ struct ub_ring_eth_internals {
 static void *enc(struct rte_mbuf *m, uint32_t pi, struct rte_ub_ring_handle *h)
 {
 	uint32_t esz = rte_ub_ring_get_data_elt_size(h, pi);
-	uint32_t need = sizeof(struct rte_mbuf) + m->priv_size + m->buf_len;
+	/* copy only header + priv + headroom + data (no tailroom) */
+	uint32_t need = sizeof(struct rte_mbuf) + m->priv_size +
+			m->data_off + m->data_len;
 	if (need > esz) return NULL;
 	void *buf = rte_ub_ring_alloc_buf(h, pi); if (!buf) return NULL;
-	struct rte_mbuf *d = buf; memcpy(buf, m, need);
+
+	/* encode chain first (recursive) */
+	void *nb = NULL;
 	if (m->next) {
-		void *nb = enc(m->next, pi, h);
-		if (nb) { uint64_t off = (uint64_t)((char *)nb - (char *)rte_ub_ring_get_data_buf_area(h, pi));
-			d->next = (struct rte_mbuf *)(uintptr_t)(((uint64_t)pi << 56) | off); }
-		else { rte_ub_ring_free_buf(h, buf); return NULL; }
-	} else d->next = (struct rte_mbuf *)(uintptr_t)UINT64_MAX;
-	d->pool = NULL; return buf;
+		nb = enc(m->next, pi, h);
+		if (!nb) { rte_ub_ring_free_buf(h, buf); return NULL; }
+	}
+
+	/*
+	 * Optimisation: mutate the LOCAL mbuf's next/pool/buf_len,
+	 * memcpy once, then restore. Avoids separate slow writes to
+	 * shared memory.
+	 */
+	struct rte_mbuf *save_next = m->next;
+	struct rte_mempool *save_pool = m->pool;
+	uint16_t save_buf_len = m->buf_len;
+
+	if (nb) {
+		uint64_t off = (uint64_t)((char *)nb -
+			(char *)rte_ub_ring_get_data_buf_area(h, pi));
+		m->next = (struct rte_mbuf *)(uintptr_t)(((uint64_t)pi << 56) | off);
+	} else {
+		m->next = (struct rte_mbuf *)(uintptr_t)UINT64_MAX;
+	}
+	m->pool = NULL;
+	m->buf_len = m->data_off + m->data_len; /* no tailroom in shm */
+
+	memcpy(buf, m, need);
+
+	m->next = save_next;
+	m->pool = save_pool;
+	m->buf_len = save_buf_len;
+	return buf;
 }
 
 /* free an ENCODED buffer chain (next = packed {ni, off} or UINT64_MAX) */
@@ -146,20 +173,24 @@ static uint16_t eth_rx(void *q, struct rte_mbuf **b, uint16_t nb) {
 
 static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 	struct ub_ring_eth_queue *rq=q; struct ub_ring_eth_internals *in=rq->internals;
-	struct rte_ub_ring_handle *h=in->ub_ring_h; void *raw[nb]; uint16_t c=0;
-	for(uint16_t i=0;i<nb;i++){void*buf=enc(m[i],rq->provider_index,h);if(!buf)break;raw[c++]=buf;}
+	struct rte_ub_ring_handle *h=in->ub_ring_h;
+	void *raw[nb]; uint32_t raw_pi[nb]; uint16_t c=0;
+	for(uint16_t i=0;i<nb;i++){
+		void*buf=enc(m[i],rq->provider_index,h);
+		if(!buf)break;
+		raw[c]=buf; raw_pi[c]=rq->provider_index; c++;
+	}
 	if(!c)return 0;
 	/*
 	 * Ownership model:
 	 *  - sent buffers: ownership transferred to peer; peer returns
 	 *    them via pktmbuf_free → drain → return ring → collect.
 	 *  - unsent buffers (s < c): ownership still local, return to
-	 *    local data ring. fail-fast send_burst makes s ∈ {0, c},
-	 *    so this loop frees all-or-nothing.
+	 *    local data ring. fail-fast send makes s ∈ {0, c}.
 	 */
 	uint16_t s = rte_ub_ring_is_mpmc_enabled(h)
-		? rte_ub_ring_mp_send_burst(h, rq->queue_id, raw, c)
-		: rte_ub_ring_send_burst(h, rq->queue_id, raw, c);
+		? rte_ub_ring_mp_send_burst_pi(h, rq->queue_id, raw_pi, raw, c)
+		: rte_ub_ring_send_burst_pi(h, rq->queue_id, raw_pi, raw, c);
 	for (uint16_t i = s; i < c; i++)
 		free_enc_chain(h, raw[i]);
 	return s; }
