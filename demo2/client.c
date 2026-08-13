@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Client — w0 RR q0/q1, w1 RR q2/q3, 1 flush, fire-and-forget.
+ * Client — 2 send lcores + 1 flush lcore, each sender counts its own pps.
  * Run: ./client --no-huge -l 1-4
  */
 #include <stdio.h>
@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <rte_eal.h>
 #include <rte_launch.h>
+#include <rte_cycles.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_ethdev.h>
@@ -17,7 +18,6 @@
 #define NQ      4
 #define NP      (1024*1024)
 #define BS      32
-#define SEND_US 100000
 
 static volatile int g_running = 1;
 static struct rte_ub_ring_handle *g_h;
@@ -32,7 +32,7 @@ static int flush_worker(void *arg)
 			rte_ub_ring_flush_rx(g_h, q);
 		}
 		rte_ub_ring_collect(g_h);
-		usleep(50);
+		usleep(1);
 	}
 	return 0;
 }
@@ -43,45 +43,45 @@ static int sender(void *a)
 {
 	struct sarg *sa = a;
 	struct rte_mbuf *burst[BS];
-	int sent_total = 0;
+	uint32_t rounds = NP / 2 / BS;
+	uint32_t sent_total = 0;
 
-	for (int i = 0; i < NP / 2; i += BS) {
-		uint32_t q = (i & 1) ? sa->q1 : sa->q0;
-		int n = RTE_MIN(BS, NP / 2 - i);
+	/* phase 1 (untimed): build one batch of packets, reused every round */
+	for (int i = 0; i < BS; i++) {
+		struct rte_mbuf *m = rte_pktmbuf_alloc(sa->mp);
+		if (!m) break;
+		char buf[64]; int l = snprintf(buf, 64, "Hello #%d", i);
+		rte_pktmbuf_append(m, l);
+		rte_memcpy(rte_pktmbuf_mtod(m, char *), buf, l);
+		burst[i] = m;
+	}
 
-		/* allocate a burst */
-		int got = 0;
-		for (int j = 0; j < n; j++) {
-			struct rte_mbuf *m = rte_pktmbuf_alloc(sa->mp);
-			if (!m) break;
-			char buf[64]; int l = snprintf(buf, 64, "Hello #%d", i + j);
-			rte_pktmbuf_append(m, l);
-			rte_memcpy(rte_pktmbuf_mtod(m, char *), buf, l);
-			burst[got++] = m;
-		}
-		if (got == 0)
-			continue;
+	/* phase 2 (timed): send the same batch round after round */
+	uint64_t t0 = rte_rdtsc();
+	for (uint32_t r = 0; r < rounds; r++) {
+		uint32_t q = (r & 1) ? sa->q1 : sa->q0;
 
-		/* send burst, retry until all sent */
 		uint16_t sent = 0;
-		while (sent < (uint16_t)got) {
+		while (sent < BS) {
 			uint16_t s = rte_eth_tx_burst(sa->pid, q,
-				&burst[sent], got - sent);
+				&burst[sent], BS - sent);
 			if (s == 0) {
 				rte_delay_us(100);
 				continue;
 			}
 			sent += s;
 		}
-
-		for (int j = 0; j < got; j++)
-			rte_pktmbuf_free(burst[j]);
-		sent_total += got;
-		printf("[Cli lc%u] TX burst #%d: %d pkts -> q%u\n",
-			rte_lcore_id(), i / BS, got, q);
-		rte_delay_us(SEND_US);
+		sent_total += BS;
 	}
-	printf("[Cli lc%u] sent %d total\n", rte_lcore_id(), sent_total);
+	uint64_t t1 = rte_rdtsc();
+
+	/* phase 3 (untimed): free the batch */
+	for (int i = 0; i < BS; i++)
+		rte_pktmbuf_free(burst[i]);
+
+	double secs = (double)(t1 - t0) / rte_get_tsc_hz();
+	printf("[Cli lc%u] %u pkts, %.3fs, %.2f Mpps\n",
+		rte_lcore_id(), sent_total, secs, sent_total / secs / 1e6);
 	return 0;
 }
 
@@ -127,7 +127,6 @@ int main(int argc, char **argv)
 	}
 	rte_ub_ring_collect(g_h);
 
-	printf("\n[Client] done\n");
 	g_running = 0;
 	rte_eal_wait_lcore(lc[0]);
 	rte_eth_dev_stop(pid); rte_eth_dev_close(pid); rte_ub_ring_fini(h);
