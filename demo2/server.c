@@ -13,7 +13,7 @@
 #include <rte_eth_ub_ring.h>
 
 #define NQ 4
-#define NP 80
+#define NP (1024*1024)
 #define BS 32
 
 static volatile int g_running = 1;

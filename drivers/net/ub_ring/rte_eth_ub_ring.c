@@ -1,10 +1,12 @@
-/* SPDX-License-Identifier: BSD-3-Clause */
+/* SPDX-License-Identifier: BSD-3-Clause
+ *
+ * ub_ring ethdev PMD — follows rte_eth_from_rings() vdev pattern.
+ */
 
 #include <stdlib.h>
 #include <string.h>
 
 #include <rte_eal.h>
-#include <rte_kvargs.h>
 #include <rte_log.h>
 #include <rte_malloc.h>
 #include <rte_errno.h>
@@ -45,6 +47,8 @@ static void *enc(struct rte_mbuf *m, uint32_t pi, struct rte_ub_ring_handle *h)
 	if (need > esz) return NULL;
 	void *buf = rte_ub_ring_alloc_buf(h, pi); if (!buf) return NULL;
 	struct rte_mbuf *d = buf; memcpy(buf, m, need);
+	if (m->next)
+		UB_RING_ETH_LOG(INFO, "enc chained: m=%p m->next=%p", (void *)m, (void *)m->next);
 	if (m->next) {
 		void *nb = enc(m->next, pi, h);
 		if (nb) { uint64_t off = (uint64_t)((char *)nb - (char *)rte_ub_ring_get_data_buf_area(h, pi));
@@ -54,37 +58,117 @@ static void *enc(struct rte_mbuf *m, uint32_t pi, struct rte_ub_ring_handle *h)
 	d->pool = NULL; return buf;
 }
 
-static struct rte_mbuf *dec(void *buf, struct rte_mempool *dp, struct rte_ub_ring_handle *h)
+/* free an ENCODED buffer chain (next = packed {ni, off} or UINT64_MAX) */
+static void
+free_enc_chain(struct rte_ub_ring_handle *h, void *buf)
+{
+	while (buf) {
+		struct rte_mbuf *m = buf;
+		uint64_t nv = (uint64_t)(uintptr_t)m->next;
+		void *next = NULL;
+		if (nv != UINT64_MAX) {
+			uint8_t ni = (uint8_t)(nv >> 56);
+			uint64_t off = nv & 0x00FFFFFFFFFFFFFFULL;
+			next = (char *)rte_ub_ring_get_data_buf_area(h, ni) + off;
+		}
+		rte_ub_ring_free_buf(h, buf);
+		buf = next;
+	}
+}
+
+static struct rte_mbuf *dec(void *buf, struct rte_mempool *dp, struct rte_ub_ring_handle *h, int depth)
 {
 	struct rte_mbuf *m = buf;
-	m->buf_addr = (char *)m + sizeof(struct rte_mbuf) + m->priv_size; m->pool = dp;
 	uint64_t nv = (uint64_t)(uintptr_t)m->next;
-	if (nv != UINT64_MAX) { uint8_t ni = (uint8_t)(nv >> 56); uint64_t off = nv & 0x00FFFFFFFFFFFFFFULL;
-		void *nb = (char *)rte_ub_ring_get_data_buf_area(h, ni) + off; m->next = dec(nb, dp, h); }
-	else m->next = NULL; return m;
+
+	if (depth > 8) {
+		UB_RING_ETH_LOG(ERR, "decode depth exceeded: buf=%p depth=%d next=0x%" PRIx64,
+				buf, depth, nv);
+		m->next = NULL;
+		return m;
+	}
+
+	m->buf_addr = (char *)m + sizeof(struct rte_mbuf) + m->priv_size; m->pool = dp;
+	if (nv != UINT64_MAX) {
+		uint8_t ni = (uint8_t)(nv >> 56); uint64_t off = nv & 0x00FFFFFFFFFFFFFFULL;
+		void *nb = (char *)rte_ub_ring_get_data_buf_area(h, ni) + off;
+		if (nb == buf) {
+			UB_RING_ETH_LOG(ERR, "self-referencing next: buf=%p ni=%u off=0x%" PRIx64,
+					buf, ni, off);
+			m->next = NULL;
+			return m;
+		}
+		m->next = dec(nb, dp, h, depth + 1);
+	} else m->next = NULL;
+	return m;
 }
 
 static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
-{ if (!d) return; void *o[32]; int n; while ((n=rte_mempool_get_bulk(d,o,32))>0) for(int i=0;i<n;i++) rte_ub_ring_free_buf(h,o[i]); }
+{
+	if (!d) return;
+	void *o[32];
+	int total = 0;
+	for (;;) {
+		unsigned int cnt = rte_mempool_avail_count(d);
+		if (cnt == 0)
+			break;
+		unsigned int n = RTE_MIN(cnt, 32u);
+		/* rte_mempool_get_bulk returns 0 on success, <0 on error */
+		if (rte_mempool_get_bulk(d, o, n) < 0)
+			continue; /* raced with a concurrent consumer */
+		for (unsigned int i = 0; i < n; i++)
+			rte_ub_ring_free_buf(h, o[i]);
+		total += n;
+	}
+	if (total)
+		UB_RING_ETH_LOG(INFO, "drained %d bufs from dummy pool", total);
+}
 
 static struct rte_mempool *mkp(void)
-{ struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",1024,64,0,0,NULL,NULL,NULL,NULL,rte_socket_id(),RTE_MEMPOOL_F_SP_PUT|RTE_MEMPOOL_F_SC_GET);
-	if(mp){void*o[64];int n;while((n=rte_mempool_get_bulk(mp,o,64))>0);} return mp; }
+{ /* MP/MC: multiple worker threads put (pktmbuf_free) and get (drain) */
+	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",1024,64,0,0,NULL,NULL,NULL,NULL,rte_socket_id(),0);
+	if (mp) {
+		/* drain all placeholder objects so only freed mbufs are
+		 * ever retrieved. get_bulk returns 0 on success, <0 on error */
+		void *o[64];
+		for (;;) {
+			unsigned int cnt = rte_mempool_avail_count(mp);
+			if (cnt == 0)
+				break;
+			unsigned int n = RTE_MIN(cnt, 64u);
+			if (rte_mempool_get_bulk(mp, o, n) < 0)
+				continue;
+		}
+	}
+	return mp; }
 
 static uint16_t eth_rx(void *q, struct rte_mbuf **b, uint16_t nb) {
 	struct ub_ring_eth_queue *rq=q; struct ub_ring_eth_internals *in=rq->internals;
 	struct rte_ub_ring_handle *h=in->ub_ring_h; drn(in->dummy_pool,h);
 	void *raw[UB_RING_ETH_MAX_BURST];
 	uint16_t n=rte_ub_ring_is_mpmc_enabled(h)?rte_ub_ring_mc_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST)):rte_ub_ring_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST));
-	for(uint16_t i=0;i<n;i++)b[i]=dec(raw[i],in->dummy_pool,h); return n; }
+	for(uint16_t i=0;i<n;i++)b[i]=dec(raw[i],in->dummy_pool,h,0);
+	return n; }
 
 static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 	struct ub_ring_eth_queue *rq=q; struct ub_ring_eth_internals *in=rq->internals;
 	struct rte_ub_ring_handle *h=in->ub_ring_h; void *raw[nb]; uint16_t c=0;
 	for(uint16_t i=0;i<nb;i++){void*buf=enc(m[i],rq->provider_index,h);if(!buf)break;raw[c++]=buf;}
 	if(!c)return 0;
-	uint16_t s=rte_ub_ring_is_mpmc_enabled(h)?rte_ub_ring_mp_send_burst(h,rq->queue_id,raw,c):rte_ub_ring_send_burst(h,rq->queue_id,raw,c);
-	for(uint16_t i=s;i<c;i++)rte_ub_ring_free_buf(h,raw[i]); return s; }
+	/*
+	 * Ownership model:
+	 *  - sent buffers: ownership transferred to peer; peer returns
+	 *    them via pktmbuf_free → drain → return ring → collect.
+	 *  - unsent buffers (s < c): ownership still local, return to
+	 *    local data ring. fail-fast send_burst makes s ∈ {0, c},
+	 *    so this loop frees all-or-nothing.
+	 */
+	uint16_t s = rte_ub_ring_is_mpmc_enabled(h)
+		? rte_ub_ring_mp_send_burst(h, rq->queue_id, raw, c)
+		: rte_ub_ring_send_burst(h, rq->queue_id, raw, c);
+	for (uint16_t i = s; i < c; i++)
+		free_enc_chain(h, raw[i]);
+	return s; }
 
 static int eth_cfg(struct rte_eth_dev*d __rte_unused){return 0;}
 static int eth_start(struct rte_eth_dev*d){d->data->dev_link.link_status=RTE_ETH_LINK_UP;return 0;}
@@ -112,20 +196,18 @@ static const struct eth_dev_ops eth_ops={
 	.dev_set_link_up=eth_lu,.dev_set_link_down=eth_ld,
 };
 
-static int parse_handle(const char *k __rte_unused, const char *v, void *extra)
+static int parse_addr(const char *k __rte_unused, const char *v, void *extra)
 { *(void **)extra = (void *)(uintptr_t)strtoull(v, NULL, 0); return 0; }
 
 static int
 vdev_probe(struct rte_vdev_device *vdev)
 {
-	const char *dn = rte_vdev_device_name(vdev);
 	struct rte_kvargs *kv = rte_kvargs_parse(rte_vdev_device_args(vdev), NULL);
 	void *hp = NULL;
-	if (kv) { rte_kvargs_process(kv, "handle", parse_handle, &hp); rte_kvargs_free(kv); }
+	if (kv) { rte_kvargs_process(kv, "addr", parse_addr, &hp); rte_kvargs_free(kv); }
 	if (!hp) return -EINVAL;
 
-	const char *pfx = "net_ub_ring_", *sn = dn;
-	if (strncmp(dn, pfx, strlen(pfx)) == 0) sn = dn + strlen(pfx);
+	const char *dn = rte_vdev_device_name(vdev);
 
 	struct rte_ub_ring_handle *h = hp;
 	uint32_t nq = rte_ub_ring_get_total_queues(h);
@@ -136,41 +218,66 @@ vdev_probe(struct rte_vdev_device *vdev)
 	void **txq = rte_calloc_socket(NULL, nq, sizeof(void *), 0, rte_socket_id());
 	if (!rxq || !txq) { rte_free(rxq); rte_free(txq); rte_free(in); return -ENOMEM; }
 	for (uint32_t i = 0; i < nq; i++) {
-		in->rx_queues[i].queue_id=i; in->rx_queues[i].provider_index=rte_ub_ring_queue_to_provider(h,i);
-		in->rx_queues[i].internals=in;
-		in->tx_queues[i].queue_id=i; in->tx_queues[i].provider_index=rte_ub_ring_queue_to_provider(h,i);
-		in->tx_queues[i].internals=in;
+		in->rx_queues[i].queue_id = i;
+		in->rx_queues[i].provider_index = rte_ub_ring_queue_to_provider(h, i);
+		in->rx_queues[i].internals = in;
+		in->tx_queues[i].queue_id = i;
+		in->tx_queues[i].provider_index = rte_ub_ring_queue_to_provider(h, i);
+		in->tx_queues[i].internals = in;
 	}
-	struct rte_eth_dev *ed = rte_eth_dev_allocate(sn);
+	struct rte_eth_dev *ed = rte_eth_dev_allocate(dn);
 	if (!ed) { rte_free(rxq); rte_free(txq); rte_free(in); return -ENODEV; }
-	ed->data->rx_queues=rxq; ed->data->tx_queues=txq;
-	ed->data->nb_rx_queues=(uint16_t)nq; ed->data->nb_tx_queues=(uint16_t)nq;
-	ed->data->dev_private=in; ed->data->numa_node=rte_socket_id();
-	ed->data->promiscuous=1; ed->data->all_multicast=1;
-	ed->data->dev_flags|=RTE_ETH_DEV_AUTOFILL_QUEUE_XSTATS;
-	for (uint32_t i=0;i<nq;i++){ed->data->rx_queues[i]=&in->rx_queues[i];ed->data->tx_queues[i]=&in->tx_queues[i];}
-	in->address=(struct rte_ether_addr){.addr_bytes={0x02}};ed->data->mac_addrs=&in->address;
-	ed->data->dev_link=(struct rte_eth_link){.link_speed=RTE_ETH_SPEED_NUM_10G,.link_duplex=RTE_ETH_LINK_FULL_DUPLEX,.link_status=RTE_ETH_LINK_DOWN,.link_autoneg=RTE_ETH_LINK_FIXED};
-	ed->device=&vdev->device; ed->dev_ops=&eth_ops; ed->rx_pkt_burst=eth_rx; ed->tx_pkt_burst=eth_tx;
+	ed->data->rx_queues = rxq; ed->data->tx_queues = txq;
+	ed->data->nb_rx_queues = (uint16_t)nq; ed->data->nb_tx_queues = (uint16_t)nq;
+	ed->data->dev_private = in; ed->data->numa_node = rte_socket_id();
+	ed->data->promiscuous = 1; ed->data->all_multicast = 1;
+	ed->data->dev_flags |= RTE_ETH_DEV_AUTOFILL_QUEUE_XSTATS;
+	for (uint32_t i = 0; i < nq; i++) {
+		ed->data->rx_queues[i] = &in->rx_queues[i];
+		ed->data->tx_queues[i] = &in->tx_queues[i];
+	}
+	in->address = (struct rte_ether_addr){ .addr_bytes = {0x02} };
+	ed->data->mac_addrs = &in->address;
+	ed->data->dev_link = (struct rte_eth_link){
+		.link_speed = RTE_ETH_SPEED_NUM_10G, .link_duplex = RTE_ETH_LINK_FULL_DUPLEX,
+		.link_status = RTE_ETH_LINK_DOWN, .link_autoneg = RTE_ETH_LINK_FIXED,
+	};
+	ed->device = &vdev->device;
+	ed->dev_ops = &eth_ops;
+	ed->rx_pkt_burst = eth_rx;
+	ed->tx_pkt_burst = eth_tx;
 	rte_eth_dev_probing_finish(ed);
 	return 0;
 }
 
 static int vdev_remove(struct rte_vdev_device *vdev)
-{ const char *n=rte_vdev_device_name(vdev); struct rte_eth_dev *ed=rte_eth_dev_allocated(n);
-	if(!ed)return 0; eth_close(ed); rte_eth_dev_release_port(ed); return 0; }
+{
+	const char *n = rte_vdev_device_name(vdev);
+	struct rte_eth_dev *ed = rte_eth_dev_allocated(n);
+	if (!ed) return 0;
+	eth_close(ed);
+	rte_eth_dev_release_port(ed);
+	return 0;
+}
 
-static struct rte_vdev_driver vdrv={.probe=vdev_probe,.remove=vdev_remove};
+static struct rte_vdev_driver vdrv = { .probe = vdev_probe, .remove = vdev_remove };
 RTE_PMD_REGISTER_VDEV(net_ub_ring, vdrv);
 
 int
 rte_eth_ub_ring_attach(const char *name, struct rte_ub_ring_handle *h)
 {
-	char da[256];
-	snprintf(da, sizeof(da), "net_ub_ring_%s,handle=%p", name, (void *)h);
-	int ret = rte_dev_probe(da);
+	char vname[64], args[32];
+	int ret;
+
+	ret = snprintf(vname, sizeof(vname), "net_ub_ring_%s", name);
+	if (ret >= (int)sizeof(vname)) { rte_errno = ENAMETOOLONG; return -1; }
+
+	snprintf(args, sizeof(args), "addr=%p", (void *)h);
+
+	ret = rte_vdev_init(vname, args);
 	if (ret) return -1;
+
 	uint16_t pid;
-	ret = rte_eth_dev_get_port_by_name(name, &pid);
+	ret = rte_eth_dev_get_port_by_name(vname, &pid);
 	return ret ? -1 : (int)pid;
 }

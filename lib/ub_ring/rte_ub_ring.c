@@ -284,9 +284,11 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		h->peers[pi].data_buf_area=ba;
 		h->peers[pi].data_buf_end=(char*)ba+(size_t)mx*elt;
 
-		/* create LOCAL data ring */
+		/* create LOCAL data ring
+		 * SP enqueue (flush thread: collect/free_buf)
+		 * MC dequeue (multiple sender threads: alloc_buf) */
 		char dn[64];snprintf(dn,64,"data_%s",pn2);
-		h->data_rings[pi]=rte_ring_create(dn,1024,rte_socket_id(),RING_F_SP_ENQ|RING_F_SC_DEQ);
+		h->data_rings[pi]=rte_ring_create(dn,1024,rte_socket_id(),RING_F_SP_ENQ);
 		if(!h->data_rings[pi]){UB_RING_LOG(ERR,"local data ring fail");goto fail_reg;}
 
 		/* populate: enqueue all free offsets to local data ring */
@@ -322,7 +324,7 @@ rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h, uint32_t pi)
 {
 	if (!h || pi>=UB_RING_MAX_NODES||!h->data_rings||!h->data_rings[pi]) return NULL;
 	void *e;
-	if (rte_ring_sc_dequeue_bulk(h->data_rings[pi], &e, 1, NULL) == 0) return NULL;
+	if (rte_ring_mc_dequeue_bulk(h->data_rings[pi], &e, 1, NULL) == 0) return NULL;
 	sync_peer_data_ring(h, pi);
 	return (char *)h->peers[pi].data_buf_area + (size_t)(uintptr_t)e;
 }
@@ -343,14 +345,17 @@ void
 rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
 {
 	if (!h || !buf) return;
+	/* single buffer only — chains are split by rte_pktmbuf_free on the
+	 * peer side, each segment entering the dummy pool separately */
 	int ni = find_peer_by_buf(h, buf);
-	if (ni < 0) return;
+	if (ni < 0) { UB_RING_LOG(ERR, "free_buf %p: peer not found", buf); return; }
 	void *e = (void *)(uintptr_t)((char *)buf - (char *)h->peers[ni].data_buf_area);
 	/* user: return to local data ring; provider: return to shm return ring */
 	if (h->data_rings && h->data_rings[ni])
 		rte_ring_sp_enqueue_bulk(h->data_rings[ni], &e, 1, NULL);
 	else if (h->peers[ni].return_ring)
 		rte_ring_mp_enqueue_bulk(h->peers[ni].return_ring, &e, 1, NULL);
+	else { UB_RING_LOG(ERR, "free_buf %p: no ring for ni=%d (leak!)", buf, ni); }
 }
 
 void
@@ -375,7 +380,8 @@ void *rte_ub_ring_get_data_buf_area(struct rte_ub_ring_handle *h, uint32_t pi)
 /* ---- Send / Recv / Flush / Fini (unchanged) ---- */
 uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
 { if(!h||q>=h->total_queues||!b||!n)return 0; void *e[n];uint16_t c=0;
-  for(uint16_t i=0;i<n;i++){if(!b[i])continue;int ni=find_peer_by_buf(h,b[i]);if(ni<0)continue;
+  /* fail-fast: any invalid buffer → send nothing (caller frees all) */
+  for(uint16_t i=0;i<n;i++){if(!b[i])return 0;int ni=find_peer_by_buf(h,b[i]);if(ni<0)return 0;
   uint64_t o=(uint64_t)((char*)b[i]-(char*)h->peers[ni].data_buf_area);e[c++]=ub_ring_elem_pack((uint8_t)ni,o);}
   return (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,c,NULL); }
 uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
@@ -397,14 +403,24 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 }
 bool rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h) { return h&&h->mpmc_enabled; }
 uint16_t rte_ub_ring_mp_send_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
-{ if(!h||!h->mpmc_enabled||q>=h->total_queues)return 0;return (uint16_t)rte_ring_enqueue_burst(h->shadow_tx[q],(void**)b,n,NULL); }
+{ if(!h||!h->mpmc_enabled||q>=h->total_queues)return 0;
+  /* fail-fast: all or nothing */
+  if (rte_ring_free_count(h->shadow_tx[q]) < n) return 0;
+  return (uint16_t)rte_ring_enqueue_burst(h->shadow_tx[q],(void**)b,n,NULL); }
 uint16_t rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
 { if(!h||!h->mpmc_enabled||q>=h->total_queues)return 0;return (uint16_t)rte_ring_dequeue_burst(h->shadow_rx[q],(void**)b,n,NULL); }
 void rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 	if (!h || !h->mpmc_enabled || q >= h->total_queues) return;
 	void *bufs[64]; uint16_t n;
-	while ((n = (uint16_t)rte_ring_dequeue_burst(h->shadow_tx[q], (void**)bufs, 64, NULL)) > 0)
-		rte_ub_ring_send_burst(h, q, bufs, n);
+	while ((n = (uint16_t)rte_ring_dequeue_burst(h->shadow_tx[q], (void**)bufs, 64, NULL)) > 0) {
+		uint16_t s = rte_ub_ring_send_burst(h, q, bufs, n);
+		if (s < n) {
+			/* fail-fast: nothing sent — put back to shadow for retry */
+			for (uint16_t i = s; i < n; i++)
+				rte_ring_enqueue_burst(h->shadow_tx[q], &bufs[i], 1, NULL);
+			break;
+		}
+	}
 }
 void rte_ub_ring_flush_rx(struct rte_ub_ring_handle *h, uint32_t q) {
 	if (!h || !h->mpmc_enabled || q >= h->total_queues) return;
