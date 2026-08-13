@@ -47,8 +47,6 @@ static void *enc(struct rte_mbuf *m, uint32_t pi, struct rte_ub_ring_handle *h)
 	if (need > esz) return NULL;
 	void *buf = rte_ub_ring_alloc_buf(h, pi); if (!buf) return NULL;
 	struct rte_mbuf *d = buf; memcpy(buf, m, need);
-	if (m->next)
-		UB_RING_ETH_LOG(INFO, "enc chained: m=%p m->next=%p", (void *)m, (void *)m->next);
 	if (m->next) {
 		void *nb = enc(m->next, pi, h);
 		if (nb) { uint64_t off = (uint64_t)((char *)nb - (char *)rte_ub_ring_get_data_buf_area(h, pi));
@@ -107,7 +105,6 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 {
 	if (!d) return;
 	void *o[32];
-	int total = 0;
 	for (;;) {
 		unsigned int cnt = rte_mempool_avail_count(d);
 		if (cnt == 0)
@@ -118,10 +115,7 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 			continue; /* raced with a concurrent consumer */
 		for (unsigned int i = 0; i < n; i++)
 			rte_ub_ring_free_buf(h, o[i]);
-		total += n;
 	}
-	if (total)
-		UB_RING_ETH_LOG(INFO, "drained %d bufs from dummy pool", total);
 }
 
 static struct rte_mempool *mkp(void)
