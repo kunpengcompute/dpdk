@@ -285,10 +285,11 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		h->peers[pi].data_buf_end=(char*)ba+(size_t)mx*elt;
 
 		/* create LOCAL data ring
-		 * SP enqueue (flush thread: collect/free_buf)
+		 * MP enqueue (flush thread collect/free_buf AND sender
+		 * threads' eth_tx failure path all enqueue concurrently)
 		 * MC dequeue (multiple sender threads: alloc_buf) */
 		char dn[64];snprintf(dn,64,"data_%s",pn2);
-		h->data_rings[pi]=rte_ring_create(dn,1024,rte_socket_id(),RING_F_SP_ENQ);
+		h->data_rings[pi]=rte_ring_create(dn,1024,rte_socket_id(),0);
 		if(!h->data_rings[pi]){UB_RING_LOG(ERR,"local data ring fail");goto fail_reg;}
 
 		/* populate: enqueue all free offsets to local data ring */
@@ -350,9 +351,10 @@ rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
 	int ni = find_peer_by_buf(h, buf);
 	if (ni < 0) { UB_RING_LOG(ERR, "free_buf %p: peer not found", buf); return; }
 	void *e = (void *)(uintptr_t)((char *)buf - (char *)h->peers[ni].data_buf_area);
-	/* user: return to local data ring; provider: return to shm return ring */
+	/* user: return to local data ring (MP — concurrent with collect);
+	 * provider: return to shm return ring */
 	if (h->data_rings && h->data_rings[ni])
-		rte_ring_sp_enqueue_bulk(h->data_rings[ni], &e, 1, NULL);
+		rte_ring_mp_enqueue_bulk(h->data_rings[ni], &e, 1, NULL);
 	else if (h->peers[ni].return_ring)
 		rte_ring_mp_enqueue_bulk(h->peers[ni].return_ring, &e, 1, NULL);
 	else { UB_RING_LOG(ERR, "free_buf %p: no ring for ni=%d (leak!)", buf, ni); }

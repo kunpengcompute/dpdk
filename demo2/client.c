@@ -42,18 +42,46 @@ struct sarg { int pid; uint32_t q0, q1; struct rte_mempool *mp; };
 static int sender(void *a)
 {
 	struct sarg *sa = a;
-	for (int i = 0; i < NP / 2; i++) {
+	struct rte_mbuf *burst[BS];
+	int sent_total = 0;
+
+	for (int i = 0; i < NP / 2; i += BS) {
 		uint32_t q = (i & 1) ? sa->q1 : sa->q0;
-		struct rte_mbuf *m = rte_pktmbuf_alloc(sa->mp);
-		if (!m) continue;
-		char buf[64]; int l = snprintf(buf, 64, "Hello #%d", i);
-		rte_pktmbuf_append(m, l);
-		rte_memcpy(rte_pktmbuf_mtod(m, char *), buf, l);
-		printf("[Cli lc%u] TX #%d -> q%u\n", rte_lcore_id(), i, q);
-		while (!rte_eth_tx_burst(sa->pid, q, &m, 1));
-		rte_pktmbuf_free(m);
+		int n = RTE_MIN(BS, NP / 2 - i);
+
+		/* allocate a burst */
+		int got = 0;
+		for (int j = 0; j < n; j++) {
+			struct rte_mbuf *m = rte_pktmbuf_alloc(sa->mp);
+			if (!m) break;
+			char buf[64]; int l = snprintf(buf, 64, "Hello #%d", i + j);
+			rte_pktmbuf_append(m, l);
+			rte_memcpy(rte_pktmbuf_mtod(m, char *), buf, l);
+			burst[got++] = m;
+		}
+		if (got == 0)
+			continue;
+
+		/* send burst, retry until all sent */
+		uint16_t sent = 0;
+		while (sent < (uint16_t)got) {
+			uint16_t s = rte_eth_tx_burst(sa->pid, q,
+				&burst[sent], got - sent);
+			if (s == 0) {
+				rte_delay_us(100);
+				continue;
+			}
+			sent += s;
+		}
+
+		for (int j = 0; j < got; j++)
+			rte_pktmbuf_free(burst[j]);
+		sent_total += got;
+		printf("[Cli lc%u] TX burst #%d: %d pkts -> q%u\n",
+			rte_lcore_id(), i / BS, got, q);
 		rte_delay_us(SEND_US);
 	}
+	printf("[Cli lc%u] sent %d total\n", rte_lcore_id(), sent_total);
 	return 0;
 }
 
@@ -91,6 +119,13 @@ int main(int argc, char **argv)
 	rte_eal_remote_launch(sender, &s0, lc[1]);
 	rte_eal_remote_launch(sender, &s1, lc[2]);
 	rte_eal_wait_lcore(lc[1]); rte_eal_wait_lcore(lc[2]);
+
+	/* final flush: drain any packets still in shadow rings */
+	for (uint32_t q = 0; q < g_nb_q; q++) {
+		rte_ub_ring_flush_tx(g_h, q);
+		rte_ub_ring_flush_rx(g_h, q);
+	}
+	rte_ub_ring_collect(g_h);
 
 	printf("\n[Client] done\n");
 	g_running = 0;
