@@ -39,6 +39,8 @@ static int flush_worker(void *arg)
 
 struct sarg { int pid; uint32_t q0, q1; struct rte_mempool *mp; };
 
+#define PKT_LEN 500
+
 static int sender(void *a)
 {
 	struct sarg *sa = a;
@@ -50,9 +52,8 @@ static int sender(void *a)
 	for (int i = 0; i < BS; i++) {
 		struct rte_mbuf *m = rte_pktmbuf_alloc(sa->mp);
 		if (!m) break;
-		char buf[64]; int l = snprintf(buf, 64, "Hello #%d", i);
-		rte_pktmbuf_append(m, l);
-		rte_memcpy(rte_pktmbuf_mtod(m, char *), buf, l);
+		rte_pktmbuf_append(m, PKT_LEN);
+		memset(rte_pktmbuf_mtod(m, char *), 0x55, PKT_LEN);
 		burst[i] = m;
 	}
 
@@ -80,8 +81,10 @@ static int sender(void *a)
 		rte_pktmbuf_free(burst[i]);
 
 	double secs = (double)(t1 - t0) / rte_get_tsc_hz();
-	printf("[Cli lc%u] %u pkts, %.3fs, %.2f Mpps\n",
-		rte_lcore_id(), sent_total, secs, sent_total / secs / 1e6);
+	double mpps = sent_total / secs / 1e6;
+	double mbps = mpps * PKT_LEN * 8;
+	printf("[Cli lc%u] %u pkts, %.3fs, %.2f Mpps, %.2f Mbps\n",
+		rte_lcore_id(), sent_total, secs, mpps, mbps);
 	return 0;
 }
 

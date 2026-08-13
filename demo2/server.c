@@ -38,8 +38,9 @@ static int worker(void *a)
 	}
 	t1 = rte_rdtsc();
 	double secs = (double)(t1 - t0) / rte_get_tsc_hz();
-	printf("[Srv q%u] %u pkts, %.3fs, %.2f Mpps\n",
-		ta->qid, rx, secs, rx / secs / 1e6);
+	double mpps = rx / secs / 1e6;
+	printf("[Srv q%u] %u pkts, %.3fs, %.2f Mpps, %.2f Mbps\n",
+		ta->qid, rx, secs, mpps, mpps * 500 * 8);
 	return 0;
 }
 
