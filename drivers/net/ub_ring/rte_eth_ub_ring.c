@@ -40,19 +40,40 @@ struct ub_ring_eth_internals {
 	struct rte_ether_addr address;
 };
 
-static void *enc(struct rte_mbuf *m, uint32_t pi, struct rte_ub_ring_handle *h)
+static void *enc(struct rte_mbuf *m, uint32_t pi_pref,
+		 struct rte_ub_ring_handle *h, uint32_t *pi_out)
 {
-	uint32_t esz = rte_ub_ring_get_data_elt_size(h, pi);
 	/* copy only header + priv + headroom + data (no tailroom) */
 	uint32_t need = sizeof(struct rte_mbuf) + m->priv_size +
 			m->data_off + m->data_len;
-	if (need > esz) return NULL;
-	void *buf = rte_ub_ring_alloc_buf(h, pi); if (!buf) return NULL;
+
+	/*
+	 * Try the target provider's data ring first; if exhausted, fall
+	 * back to any other node's data ring. The actual provider index
+	 * is returned in *pi_out so the caller can pack ring elements
+	 * correctly.
+	 */
+	uint32_t pi = pi_pref;
+	void *buf = NULL;
+	if (rte_ub_ring_get_data_elt_size(h, pi) >= need)
+		buf = rte_ub_ring_alloc_buf(h, pi);
+	if (!buf) {
+		for (uint32_t c = 0; c < UB_RING_MAX_NODES; c++) {
+			if (c == pi_pref)
+				continue;
+			if (rte_ub_ring_get_data_elt_size(h, c) < need)
+				continue;
+			buf = rte_ub_ring_alloc_buf(h, c);
+			if (buf) { pi = c; break; }
+		}
+	}
+	if (!buf) return NULL;
 
 	/* encode chain first (recursive) */
 	void *nb = NULL;
+	uint32_t nb_pi = 0;
 	if (m->next) {
-		nb = enc(m->next, pi, h);
+		nb = enc(m->next, pi, h, &nb_pi);
 		if (!nb) { rte_ub_ring_free_buf(h, buf); return NULL; }
 	}
 
@@ -67,8 +88,8 @@ static void *enc(struct rte_mbuf *m, uint32_t pi, struct rte_ub_ring_handle *h)
 
 	if (nb) {
 		uint64_t off = (uint64_t)((char *)nb -
-			(char *)rte_ub_ring_get_data_buf_area(h, pi));
-		m->next = (struct rte_mbuf *)(uintptr_t)(((uint64_t)pi << 56) | off);
+			(char *)rte_ub_ring_get_data_buf_area(h, nb_pi));
+		m->next = (struct rte_mbuf *)(uintptr_t)(((uint64_t)nb_pi << 56) | off);
 	} else {
 		m->next = (struct rte_mbuf *)(uintptr_t)UINT64_MAX;
 	}
@@ -80,6 +101,7 @@ static void *enc(struct rte_mbuf *m, uint32_t pi, struct rte_ub_ring_handle *h)
 	m->next = save_next;
 	m->pool = save_pool;
 	m->buf_len = save_buf_len;
+	*pi_out = pi;
 	return buf;
 }
 
@@ -176,9 +198,10 @@ static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 	struct rte_ub_ring_handle *h=in->ub_ring_h;
 	void *raw[nb]; uint32_t raw_pi[nb]; uint16_t c=0;
 	for(uint16_t i=0;i<nb;i++){
-		void*buf=enc(m[i],rq->provider_index,h);
+		uint32_t pi_used;
+		void*buf=enc(m[i],rq->provider_index,h,&pi_used);
 		if(!buf)break;
-		raw[c]=buf; raw_pi[c]=rq->provider_index; c++;
+		raw[c]=buf; raw_pi[c]=pi_used; c++;
 	}
 	if(!c)return 0;
 	/*
