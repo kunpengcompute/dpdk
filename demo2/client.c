@@ -1,14 +1,17 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Client — N send lcores + 1 flush lcore, each sender counts its own pps.
- * Run: ./client --no-huge -l 1-5 --ns=2 --pktlen=500
+ * Client — N send lcores + 1 flush lcore, continuous TX with
+ * per-second rate output on every lcore.
+ * Run: ./client --no-huge -l 1-5 --ns=2 --pktlen=500 [--time=10]
  *      ns     = number of sender lcores (any value vs server queues:
  *               ns <= nq → contiguous queue blocks, RR within block;
  *               ns >  nq → sender s shares queue s % nq)
  *      pktlen = packet payload size (<= RTE_MBUF_DEFAULT_BUF_SIZE - headroom)
+ *      time   = run duration in seconds (0 = run until Ctrl+C)
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 #include <rte_eal.h>
 #include <rte_launch.h>
@@ -19,12 +22,17 @@
 #include <rte_ub_ring.h>
 #include <rte_eth_ub_ring.h>
 
-#define NP      (1024*1024 + 1024)
-#define BS      32
+#define BS 32
 
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_running = 1;
 static struct rte_ub_ring_handle *g_h;
 static uint32_t g_nb_q;
+
+static void on_sigint(int sig)
+{
+	(void)sig;
+	g_running = 0;
+}
 
 /* parse "--opt=N" BEFORE eal_init and strip it from argv, so EAL's
  * getopt never sees it (would fail with "unrecognized option") */
@@ -60,20 +68,16 @@ static int flush_worker(void *arg)
 	return 0;
 }
 
-struct sarg { int pid; uint32_t q0, nq_own, rounds, pkt_len;
+struct sarg { int pid; uint32_t q0, nq_own, pkt_len;
 	struct rte_mempool *mp; };
 
 static int sender(void *a)
 {
 	struct sarg *sa = a;
 	struct rte_mbuf *burst[BS];
-	uint32_t sent_total = 0;
-
-	if (sa->nq_own == 0)
-		return 0;
-
-	/* phase 1 (untimed): build one batch of packets, reused every round */
 	int nb_built = 0;
+
+	/* build one batch of packets, reused for the whole run */
 	for (int i = 0; i < BS; i++) {
 		struct rte_mbuf *m = rte_pktmbuf_alloc(sa->mp);
 		if (!m) break;
@@ -88,34 +92,37 @@ static int sender(void *a)
 		return 0;
 	}
 
-	/* phase 2 (timed): send the same batch round after round,
-	 * RR over this sender's own queue block */
-	uint64_t t0 = rte_rdtsc();
-	for (uint32_t r = 0; r < sa->rounds; r++) {
-		uint32_t q = sa->q0 + (r % sa->nq_own);
-
-		uint16_t sent = 0;
-		while (sent < nb_built) {
-			uint16_t s = rte_eth_tx_burst(sa->pid, q,
-				&burst[sent], nb_built - sent);
-			if (s == 0) {
-				continue;
+	/* send round-robin over this sender's queues forever,
+	 * print the rate once per second */
+	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc(), window = 0;
+	while (g_running) {
+		for (uint32_t i = 0; i < sa->nq_own && g_running; i++) {
+			uint32_t q = sa->q0 + i;
+			uint16_t sent = 0;
+			while (g_running && sent < nb_built) {
+				uint16_t s = rte_eth_tx_burst(sa->pid, q,
+					&burst[sent], nb_built - sent);
+				if (s == 0)
+					continue;
+				sent += s;
 			}
-			sent += s;
-		}
-		sent_total += nb_built;
-	}
-	uint64_t t1 = rte_rdtsc();
+			window += sent;
 
-	/* phase 3 (untimed): free the batch */
+			uint64_t now = rte_rdtsc();
+			if (now - last >= hz) {
+				double secs = (double)(now - last) / hz;
+				double mpps = window / secs / 1e6;
+				printf("[Cli lc%u] %.2f Mpps, %.2f Mbps\n",
+					rte_lcore_id(), mpps,
+					mpps * sa->pkt_len * 8);
+				last = now;
+				window = 0;
+			}
+		}
+	}
+
 	for (int i = 0; i < nb_built; i++)
 		rte_pktmbuf_free(burst[i]);
-
-	double secs = (double)(t1 - t0) / rte_get_tsc_hz();
-	double mpps = sent_total / secs / 1e6;
-	double mbps = mpps * sa->pkt_len * 8;
-	printf("[Cli lc%u] %u pkts, %.3fs, %.2f Mpps, %.2f Mbps\n",
-		rte_lcore_id(), sent_total, secs, mpps, mbps);
 	return 0;
 }
 
@@ -130,7 +137,10 @@ int main(int argc, char **argv)
 			RTE_MBUF_DEFAULT_BUF_SIZE - RTE_PKTMBUF_HEADROOM);
 		return 1;
 	}
+	uint32_t duration = app_opt_uint(&argc, argv, "--time", 0);
 	rte_eal_init(argc, argv);
+	signal(SIGINT, on_sigint);
+	signal(SIGTERM, on_sigint);
 
 	unsigned int ml = rte_get_main_lcore();
 	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;
@@ -154,24 +164,22 @@ int main(int argc, char **argv)
 	rte_eth_dev_configure(pid, tq, tq, &c);
 	rte_eth_dev_start(pid);
 
-	printf("\n===== Client (%u queues, %u sender lcores, %uB pkts, flush=lc%u) =====\n\n",
-		tq, ns, pkt_len, lc[0]);
+	printf("\n===== Client (%u queues, %u sender lcores, %uB pkts, %s) =====\n\n",
+		tq, ns, pkt_len, duration ? "timed" : "Ctrl+C to stop");
 
 	g_h = h; g_nb_q = tq;
 	rte_eal_remote_launch(flush_worker, NULL, lc[0]);
 
 	/* each sender holds BS mbufs for the whole run (TX ownership
 	 * transferred, local mbufs never returned) → pool = ns * BS.
-	 * cache_size=0: senders allocate the whole batch once in phase 1,
-	 * and a per-lcore cache would refill cache_size+1 objects and
-	 * strand them, starving the other senders */
+	 * cache_size=0: senders allocate the whole batch once, and a
+	 * per-lcore cache would refill cache_size+1 objects and strand
+	 * them, starving the other senders */
 	uint32_t pool_n = ns * BS;
 	struct rte_mempool *mp = rte_pktmbuf_pool_create("tx", pool_n,
 		0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	if (!mp) { fprintf(stderr, "pool create fail\n"); return 1; }
 
-	/* each queue must get >= NP/tq packets: per-queue burst rounds */
-	uint32_t R = (NP / tq + BS - 1) / BS;
 	struct sarg sa[RTE_MAX_LCORE];
 	if (ns <= tq) {
 		/* contiguous even split: first `rem` senders take one
@@ -181,38 +189,39 @@ int main(int argc, char **argv)
 			sa[s].pid = pid;
 			sa[s].q0 = s * base + RTE_MIN(s, rem);
 			sa[s].nq_own = base + (s < rem);
-			sa[s].rounds = sa[s].nq_own * R;
 			sa[s].pkt_len = pkt_len;
 			sa[s].mp = mp;
 			rte_eal_remote_launch(sender, &sa[s], lc[1 + s]);
 		}
 	} else {
-		/* more senders than queues: sender s shares queue s % tq,
-		 * the queue's rounds split evenly among its senders */
+		/* more senders than queues: sender s shares queue s % tq */
 		for (uint32_t s = 0; s < ns; s++) {
-			uint32_t q = s % tq;
-			uint32_t m = (ns - q + tq - 1) / tq; /* senders on q */
 			sa[s].pid = pid;
-			sa[s].q0 = q;
+			sa[s].q0 = s % tq;
 			sa[s].nq_own = 1;
-			sa[s].rounds = (R + m - 1) / m;
 			sa[s].pkt_len = pkt_len;
 			sa[s].mp = mp;
 			rte_eal_remote_launch(sender, &sa[s], lc[1 + s]);
 		}
+	}
+
+	/* run until the timer expires or Ctrl+C sets g_running = 0 */
+	if (duration > 0) {
+		uint64_t end = rte_rdtsc() + (uint64_t)duration * rte_get_tsc_hz();
+		while (g_running && rte_rdtsc() < end)
+			rte_delay_us_sleep(200000);
+		g_running = 0;
 	}
 	for (uint32_t s = 0; s < ns; s++)
 		rte_eal_wait_lcore(lc[1 + s]);
 
 	/* stop the flush worker FIRST: shadow rings are SC_DEQ and shm
 	 * rings are SP_ENQ — a concurrent final flush from main would
-	 * corrupt the rings and lose the last packets some server
-	 * workers are still waiting for */
+	 * corrupt the rings and lose packets */
 	g_running = 0;
 	rte_eal_wait_lcore(lc[0]);
 
-	/* final flush alone: retry until every shadow ring is empty (the
-	 * server keeps consuming until its workers finish) */
+	/* final flush alone (bounded: gives up if the peer stopped) */
 	rte_ub_ring_flush_tx_all(g_h);
 	for (uint32_t q = 0; q < g_nb_q; q++)
 		rte_ub_ring_flush_rx(g_h, q);

@@ -1,10 +1,14 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Server — N workers (one per queue), each counts its own packets and pps.
- * Run: ./server --no-huge -l 1-5 --nq=4   (nq = number of queues/workers)
+ * Server — N workers (one per queue), continuous RX with per-second
+ * rate output on every worker.
+ * Run: ./server --no-huge -l 1-5 --nq=4 [--time=10]
+ *      nq   = number of queues/workers
+ *      time = run duration in seconds (0 = run until Ctrl+C)
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 #include <rte_eal.h>
 #include <rte_launch.h>
@@ -14,10 +18,16 @@
 #include <rte_ub_ring.h>
 #include <rte_eth_ub_ring.h>
 
-#define NP (1024*1024)
 #define BS 32
 
+static volatile sig_atomic_t g_running = 1;
 static uint32_t g_nq;
+
+static void on_sigint(int sig)
+{
+	(void)sig;
+	g_running = 0;
+}
 
 /* parse "--opt=N" BEFORE eal_init and strip it from argv, so EAL's
  * getopt never sees it (would fail with "unrecognized option") */
@@ -45,32 +55,32 @@ static int worker(void *a)
 {
 	struct targ *ta = a;
 	struct rte_mbuf *pkts[BS];
-	uint32_t rx = 0;
-	uint64_t rx_bytes = 0;
-	uint64_t t0 = 0, t1;
+	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
+	uint64_t window = 0, win_bytes = 0;
 
-	/* client delivers whole BS-bursts per queue; align the target up
-	 * to a burst multiple so every queue reports the same count */
-	uint32_t target = ((NP / g_nq + BS - 1) / BS) * BS;
-
-	while (rx < target) {
+	/* receive forever, print the rate once per second
+	 * (bandwidth uses the actual pkt_len of each packet) */
+	while (g_running) {
 		uint16_t n = rte_eth_rx_burst(ta->pid, ta->qid, pkts, BS);
 		if (n == 0)
 			continue;
-		if (rx == 0)
-			t0 = rte_rdtsc();
 		for (uint16_t i = 0; i < n; i++) {
-			rx_bytes += pkts[i]->pkt_len;
+			win_bytes += pkts[i]->pkt_len;
 			rte_pktmbuf_free(pkts[i]);
 		}
-		rx += n;
+		window += n;
+
+		uint64_t now = rte_rdtsc();
+		if (now - last >= hz) {
+			double secs = (double)(now - last) / hz;
+			double mpps = window / secs / 1e6;
+			printf("[Srv q%u] %.2f Mpps, %.2f Mbps\n",
+				ta->qid, mpps, win_bytes / secs * 8 / 1e6);
+			last = now;
+			window = 0;
+			win_bytes = 0;
+		}
 	}
-	t1 = rte_rdtsc();
-	double secs = (double)(t1 - t0) / rte_get_tsc_hz();
-	double mpps = rx / secs / 1e6;
-	double mbps = rx_bytes / secs * 8 / 1e6;
-	printf("[Srv q%u] %u pkts (%lu B), %.3fs, %.2f Mpps, %.2f Mbps\n",
-		ta->qid, rx, rx_bytes, secs, mpps, mbps);
 	return 0;
 }
 
@@ -81,7 +91,10 @@ int main(int argc, char **argv)
 		fprintf(stderr, "bad --nq\n");
 		return 1;
 	}
+	uint32_t duration = app_opt_uint(&argc, argv, "--time", 0);
 	rte_eal_init(argc, argv);
+	signal(SIGINT, on_sigint);
+	signal(SIGTERM, on_sigint);
 
 	unsigned int ml = rte_get_main_lcore();
 	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;
@@ -92,7 +105,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	printf("\n===== Server (%u queues, %u workers) =====\n\n", g_nq, nl);
+	printf("\n===== Server (%u queues, %u workers, %s) =====\n\n",
+		g_nq, nl, duration ? "timed" : "Ctrl+C to stop");
 
 	const char *pn[] = {"master"}, *un[] = {"worker1"};
 	struct rte_ub_ring_handle *h = rte_ub_ring_provider_init(
@@ -106,6 +120,14 @@ int main(int argc, char **argv)
 	for (uint32_t q = 0; q < g_nq; q++) {
 		ta[q] = (struct targ){ pid, q };
 		rte_eal_remote_launch(worker, &ta[q], lc[q]);
+	}
+
+	/* run until the timer expires or Ctrl+C sets g_running = 0 */
+	if (duration > 0) {
+		uint64_t end = rte_rdtsc() + (uint64_t)duration * rte_get_tsc_hz();
+		while (g_running && rte_rdtsc() < end)
+			rte_delay_us_sleep(200000);
+		g_running = 0;
 	}
 	for (uint32_t q = 0; q < g_nq; q++)
 		rte_eal_wait_lcore(lc[q]);
