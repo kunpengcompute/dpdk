@@ -71,12 +71,19 @@ static int sender(void *a)
 		return 0;
 
 	/* phase 1 (untimed): build one batch of packets, reused every round */
+	int nb_built = 0;
 	for (int i = 0; i < BS; i++) {
 		struct rte_mbuf *m = rte_pktmbuf_alloc(sa->mp);
 		if (!m) break;
 		rte_pktmbuf_append(m, sa->pkt_len);
 		memset(rte_pktmbuf_mtod(m, char *), 0x55, sa->pkt_len);
 		burst[i] = m;
+		nb_built++;
+	}
+	if (nb_built == 0) {
+		printf("[Cli lc%u] pool exhausted, nothing to send\n",
+			rte_lcore_id());
+		return 0;
 	}
 
 	/* phase 2 (timed): send the same batch round after round */
@@ -85,21 +92,21 @@ static int sender(void *a)
 		uint32_t q = sa->q0 + (r % sa->nq_own) * sa->qstride;
 
 		uint16_t sent = 0;
-		while (sent < BS) {
+		while (sent < nb_built) {
 			uint16_t s = rte_eth_tx_burst(sa->pid, q,
-				&burst[sent], BS - sent);
+				&burst[sent], nb_built - sent);
 			if (s == 0) {
 				rte_delay_us(100);
 				continue;
 			}
 			sent += s;
 		}
-		sent_total += BS;
+		sent_total += nb_built;
 	}
 	uint64_t t1 = rte_rdtsc();
 
 	/* phase 3 (untimed): free the batch */
-	for (int i = 0; i < BS; i++)
+	for (int i = 0; i < nb_built; i++)
 		rte_pktmbuf_free(burst[i]);
 
 	double secs = (double)(t1 - t0) / rte_get_tsc_hz();
@@ -155,8 +162,13 @@ int main(int argc, char **argv)
 	g_h = h; g_nb_q = tq;
 	rte_eal_remote_launch(flush_worker, NULL, lc[0]);
 
-	struct rte_mempool *mp = rte_pktmbuf_pool_create("tx", 256, 32, 0,
-		RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+	/* each sender holds BS mbufs for the whole run (TX ownership
+	 * transferred, local mbufs never returned) → pool = ns * BS */
+	uint32_t pool_n = ns * BS;
+	struct rte_mempool *mp = rte_pktmbuf_pool_create("tx", pool_n,
+		RTE_MIN(32u, pool_n / 2), 0, RTE_MBUF_DEFAULT_BUF_SIZE,
+		rte_socket_id());
+	if (!mp) { fprintf(stderr, "pool create fail\n"); return 1; }
 
 	/* round-robin queues across senders: sender s gets {s, s+ns, ...} */
 	struct sarg sa[RTE_MAX_LCORE];
