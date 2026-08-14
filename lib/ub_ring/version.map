@@ -4,6 +4,7 @@ DPDK_25 {
 	rte_ub_ring_alloc_buf;
 	rte_ub_ring_free_buf;
 	rte_ub_ring_return_buf;
+	rte_ub_ring_return_burst;
 	rte_ub_ring_collect;
 	rte_ub_ring_fini;
 	rte_ub_ring_get_data_buf_area;

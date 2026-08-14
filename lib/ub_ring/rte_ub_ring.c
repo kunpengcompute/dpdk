@@ -343,6 +343,29 @@ rte_ub_ring_return_buf(struct rte_ub_ring_handle *h, void *buf)
 }
 
 void
+rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs, uint16_t nb)
+{
+	if (!h || !bufs || !nb) return;
+	int ni0 = find_peer_by_buf(h, bufs[0]);
+	if (ni0 < 0) return;
+	void *e[nb];
+	uint16_t c = 0;
+	for (uint16_t i = 0; i < nb; i++) {
+		int ni = find_peer_by_buf(h, bufs[i]);
+		if (ni < 0 || ni != ni0) {
+			/* buffers span several peers: fall back per buffer */
+			for (uint16_t k = 0; k < nb; k++)
+				rte_ub_ring_return_buf(h, bufs[k]);
+			return;
+		}
+		e[c++] = (void *)(uintptr_t)((char *)bufs[i] -
+			(char *)h->peers[ni0].data_buf_area);
+	}
+	if (!h->peers[ni0].return_ring) return;
+	rte_ring_mp_enqueue_bulk(h->peers[ni0].return_ring, e, c, NULL);
+}
+
+void
 rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
 {
 	if (!h || !buf) return;

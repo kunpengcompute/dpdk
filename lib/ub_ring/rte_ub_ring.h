@@ -178,6 +178,14 @@ void rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf);
 void rte_ub_ring_return_buf(struct rte_ub_ring_handle *h, void *buf);
 
 /**
+ * Return a batch of used buffers to the providers' return rings.
+ * One bulk MP enqueue when all buffers belong to the same peer —
+ * much cheaper than nb single-buffer enqueues under contention.
+ */
+void rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs,
+			      uint16_t nb);
+
+/**
  * Collect all buffers from return rings and enqueue to local data rings.
  * User side only. Should be called from the flush path.
  */

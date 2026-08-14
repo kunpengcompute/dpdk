@@ -63,7 +63,6 @@ static int flush_worker(void *arg)
 			rte_ub_ring_flush_rx(g_h, q);
 		}
 		rte_ub_ring_collect(g_h);
-		usleep(1);
 	}
 	return 0;
 }
