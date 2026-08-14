@@ -58,7 +58,7 @@ static int flush_worker(void *arg)
 	return 0;
 }
 
-struct sarg { int pid; uint32_t q0, qstride, nq_own, rounds, pkt_len;
+struct sarg { int pid; uint32_t q0, nq_own, rounds, pkt_len;
 	struct rte_mempool *mp; };
 
 static int sender(void *a)
@@ -86,10 +86,11 @@ static int sender(void *a)
 		return 0;
 	}
 
-	/* phase 2 (timed): send the same batch round after round */
+	/* phase 2 (timed): send the same batch round after round,
+	 * RR over this sender's own queue block */
 	uint64_t t0 = rte_rdtsc();
 	for (uint32_t r = 0; r < sa->rounds; r++) {
-		uint32_t q = sa->q0 + (r % sa->nq_own) * sa->qstride;
+		uint32_t q = sa->q0 + (r % sa->nq_own);
 
 		uint16_t sent = 0;
 		while (sent < nb_built) {
@@ -170,15 +171,17 @@ int main(int argc, char **argv)
 		rte_socket_id());
 	if (!mp) { fprintf(stderr, "pool create fail\n"); return 1; }
 
-	/* round-robin queues across senders: sender s gets {s, s+ns, ...} */
+	/* split queues evenly (contiguous blocks) across senders:
+	 * first `rem` senders take one extra queue */
+	uint32_t base = tq / ns, rem = tq % ns;
 	struct sarg sa[RTE_MAX_LCORE];
 	for (uint32_t s = 0; s < ns; s++) {
 		sa[s].pid = pid;
-		sa[s].q0 = s;
-		sa[s].qstride = ns;
-		sa[s].nq_own = (tq - s + ns - 1) / ns;
-		/* ceil(NP/ns/BS): total sent >= NP even if ns !| NP */
-		sa[s].rounds = (NP / ns + BS - 1) / BS;
+		sa[s].q0 = s * base + RTE_MIN(s, rem);
+		sa[s].nq_own = base + (s < rem);
+		/* each queue must get >= NP/tq packets: per-queue rounds,
+		 * times this sender's queue count (RR splits evenly) */
+		sa[s].rounds = sa[s].nq_own * ((NP / tq + BS - 1) / BS);
 		sa[s].pkt_len = pkt_len;
 		sa[s].mp = mp;
 		rte_eal_remote_launch(sender, &sa[s], lc[1 + s]);
