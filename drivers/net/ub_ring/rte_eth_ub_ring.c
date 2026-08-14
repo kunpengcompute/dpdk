@@ -195,7 +195,16 @@ static uint16_t eth_rx(void *q, struct rte_mbuf **b, uint16_t nb) {
 	struct rte_ub_ring_handle *h=in->ub_ring_h; drn(in->dummy_pool,h);
 	void *raw[UB_RING_ETH_MAX_BURST];
 	uint16_t n=rte_ub_ring_is_mpmc_enabled(h)?rte_ub_ring_mc_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST)):rte_ub_ring_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST));
-	for(uint16_t i=0;i<n;i++)b[i]=dec(raw[i],in->dummy_pool,h,0);
+	/* prefetch the next buffer while decoding the current one: the
+	 * header lines are cold (the peer's remote write invalidated them
+	 * last round trip), so one-mbuf look-ahead hides the refill latency */
+	for(uint16_t i=0;i<n;i++){
+		if (i + 1 < n) {
+			rte_prefetch0(raw[i + 1]);
+			rte_prefetch0((char *)raw[i + 1] + 64);
+		}
+		b[i]=dec(raw[i],in->dummy_pool,h,0);
+	}
 	return n; }
 
 static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {

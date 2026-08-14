@@ -65,6 +65,10 @@ struct rte_ub_ring_handle {
 		struct rte_ring *return_ring;   /* in shm: providers return bufs */
 		void            *data_buf_area, *data_buf_end;
 		uint32_t         data_elt_size;
+		/* metadata cached locally at init 鈥?no shm reads afterwards */
+		uint64_t         total_size;
+		uint32_t         nb_queues;
+		char             node_name[64];
 	} peers[UB_RING_MAX_NODES];
 
 	/* local data rings (user only, one per provider shm) */
@@ -143,7 +147,8 @@ static int wait_meta(struct ub_ring_metadata *m)
 }
 
 static int
-resolve_index(const char **pn, uint32_t np, const char **un, uint32_t nu, uint32_t *mi, uint32_t *tot)
+resolve_index(const char **pn, uint32_t np, const char **un, uint32_t nu,
+	uint32_t *mi, uint32_t *tot, char (*names)[64])
 {
 	char my[MAX_HOST_NAME_DESC_LENGTH];
 	if (gethostname(my,sizeof(my))) return -1;
@@ -153,7 +158,9 @@ resolve_index(const char **pn, uint32_t np, const char **un, uint32_t nu, uint32
 	for (uint32_t i=0;i<np;i++)all[k++]=pn[i];
 	for (uint32_t i=0;i<nu;i++)all[k++]=un[i];
 	qsort(all,*tot,sizeof(char*),cmp_node);
-	for (uint32_t i=0;i<*tot;i++){if(!strcmp(all[i],my)){*mi=i;rte_free(all);return 0;}}
+	for (uint32_t i=0;i<*tot;i++){
+		if (names) snprintf(names[i],64,"%s",all[i]);
+		if(!strcmp(all[i],my)){*mi=i;rte_free(all);return 0;}}
 	rte_free(all); return -1;
 }
 
@@ -184,8 +191,10 @@ rte_ub_ring_provider_init(const char **pn, uint32_t np, const char **un, uint32_
 	if (!pn||!np||np>UB_RING_MAX_NODES||nu>UB_RING_MAX_NODES||!reg||!pre||!sz||!nq||nq>UB_RING_MAX_QUEUES||!qd||!rte_is_power_of_2(qd)){rte_errno=EINVAL;return NULL;}
 	struct rte_ub_ring_handle *h=rte_zmalloc(NULL,sizeof(*h),0); if(!h)return NULL;
 	h->role=UB_RING_ROLE_PROVIDER; snprintf(h->region_name,64,"%s",reg); snprintf(h->shm_prefix,64,"%s",pre);
-	if (resolve_index(pn,np,un,nu,&mi,&tot)<0)goto fail;
+	char names[UB_RING_MAX_NODES][64];
+	if (resolve_index(pn,np,un,nu,&mi,&tot,names)<0)goto fail;
 	h->nb_nodes=tot; h->my_node_index=mi;
+	for (uint32_t j=0;j<tot;j++) snprintf(h->peers[j].node_name,64,"%s",names[j]);
 	if (gethostname(my,sizeof(my)))goto fail;
 	UB_RING_LOG(INFO,"provider: %s idx=%u/%u nq=%u qd=%u sz=%zu",my,mi,tot,nq,qd,sz);
 	if ((rc=ubsmem_init_attributes(&o))||(rc=ubsmem_initialize(&o))){UB_RING_LOG(ERR,"ubsmem:%s(%d)",ubs_strerror(rc),rc);goto fail_ub;}
@@ -197,6 +206,7 @@ rte_ub_ring_provider_init(const char **pn, uint32_t np, const char **un, uint32_
 	if((rc=ubsmem_shmem_allocate(reg,nm,sz,0600,UBSM_FLAG_ONLY_IMPORT_NONCACHE|UBSM_FLAG_WR_DELAY_COMP))){UB_RING_LOG(ERR,"alloc:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
 	if((rc=ubsmem_shmem_map(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,nm,0,&sh))){UB_RING_LOG(ERR,"map:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
 	memset(sh,0,sz); h->peers[mi].shm_base=sh;
+	h->peers[mi].total_size=(uint64_t)sz; h->peers[mi].nb_queues=nq;
 	ms=cms(nq); rs=crs(qd); ras=cras(nq,rs);
 	for(uint32_t q=0;q<nq;q++){char rn[32];void*rx,*tx;
 		rx=(char*)sh+ms+q*rs;tx=(char*)sh+ms+(nq+q)*rs;
@@ -215,6 +225,8 @@ rte_ub_ring_provider_init(const char **pn, uint32_t np, const char **un, uint32_
 		void*psh=NULL;if(ubsmem_shmem_map(NULL,ps,PROT_READ|PROT_WRITE,MAP_SHARED,pn2,0,&psh))continue;
 		uint32_t pi=UINT32_MAX;for(uint32_t j=0;j<tot;j++){const char*n=j<np?pn[j]:un[j-np];if(!strcmp(n,pn[i])){pi=j;break;}}if(pi>=UB_RING_MAX_NODES)continue;
 		h->peers[pi].shm_base=psh;if(wait_meta((struct ub_ring_metadata*)psh)<0)goto fail_reg;
+		h->peers[pi].total_size=((struct ub_ring_metadata*)psh)->total_size;
+		h->peers[pi].nb_queues=((struct ub_ring_metadata*)psh)->nb_queues;
 		h->peers[pi].return_ring=NULL; h->peers[pi].data_buf_area=NULL;
 		UB_RING_LOG(INFO,"peer %s (pi=%u)",pn2,pi);
 	}
@@ -241,8 +253,10 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 	elt = RTE_ALIGN(elt, 128);
 	struct rte_ub_ring_handle *h=rte_zmalloc(NULL,sizeof(*h),0); if(!h)return NULL;
 	h->role=UB_RING_ROLE_USER; snprintf(h->region_name,64,"%s",reg); snprintf(h->shm_prefix,64,"%s",pre);
-	if (resolve_index(pn,np,un,nu,&mi,&tot)<0)goto fail;
+	char names[UB_RING_MAX_NODES][64];
+	if (resolve_index(pn,np,un,nu,&mi,&tot,names)<0)goto fail;
 	h->nb_nodes=tot; h->my_node_index=mi;
+	for (uint32_t j=0;j<tot;j++) snprintf(h->peers[j].node_name,64,"%s",names[j]);
 	if (gethostname(my,sizeof(my)))goto fail;
 	UB_RING_LOG(INFO,"user: %s idx=%u/%u elt=%u",my,mi,tot,elt);
 	if ((rc=ubsmem_init_attributes(&o))||(rc=ubsmem_initialize(&o))){UB_RING_LOG(ERR,"ubsmem:%s(%d)",ubs_strerror(rc),rc);goto fail_ub;}
@@ -268,6 +282,9 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		h->peers[pi].shm_base=psh;
 		struct ub_ring_metadata*pm=(struct ub_ring_metadata*)psh;
 		if (wait_meta(pm)<0){UB_RING_LOG(ERR,"meta timeout %s",pn2);goto fail_reg;}
+		/* cache metadata locally 鈥?no shm reads after init */
+		h->peers[pi].total_size=pm->total_size;
+		h->peers[pi].nb_queues=pm->nb_queues;
 		h->peers[pi].data_elt_size=elt;
 
 		/* compute data ring layout: return ring + buffer area.
@@ -310,7 +327,7 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		pm->data_ring_offset=dr_off;
 		pm->data_elt_size=elt; pm->data_nb_bufs=mx;
 		pm->state|=UB_RING_STATE_DATA_RING_READY;
-		pi_arr[nb_prov]=pi; pq_arr[nb_prov]=pm->nb_queues; nb_prov++;
+		pi_arr[nb_prov]=pi; pq_arr[nb_prov]=h->peers[pi].nb_queues; nb_prov++;
 		UB_RING_LOG(INFO,"data ring %s: %u bufs, local+return",pn2,mx);
 	}
 	h->peers[mi].return_ring=NULL; h->peers[mi].data_buf_area=NULL;
@@ -536,17 +553,17 @@ void rte_ub_ring_flush_rx(struct rte_ub_ring_handle *h, uint32_t q) {
 		rte_ring_enqueue_burst(h->shadow_rx[q], (void**)bufs, n, NULL);
 }
 int rte_ub_ring_get_queue_mapping(struct rte_ub_ring_handle *h, uint32_t pi, uint32_t sq, uint32_t *tx, uint32_t *rx)
-{ if(!h||!tx||!rx)return -EINVAL;struct ub_ring_metadata*m=peer_meta(h,pi);if(!m||sq>=m->nb_queues)return -EINVAL;uint32_t q=h->provider_base_qid[pi]+sq;*tx=q;*rx=q;return 0; }
+{ if(!h||!tx||!rx)return -EINVAL;if(pi>=UB_RING_MAX_NODES||!h->peers[pi].shm_base||sq>=h->peers[pi].nb_queues)return -EINVAL;uint32_t q=h->provider_base_qid[pi]+sq;*tx=q;*rx=q;return 0; }
 uint32_t rte_ub_ring_queue_to_provider(struct rte_ub_ring_handle *h, uint32_t q)
 { return (!h||q>=h->total_queues)?0:h->queue_to_provider[q]; }
 uint32_t rte_ub_ring_get_total_queues(struct rte_ub_ring_handle *h) { return h?h->total_queues:0; }
 int rte_ub_ring_get_node_index(struct rte_ub_ring_handle *h, uint32_t *i) { if(!h||!i)return -EINVAL;*i=h->my_node_index;return 0; }
 int rte_ub_ring_get_peer_index(struct rte_ub_ring_handle *h, const char *hn, uint32_t *i)
-{ if(!h||!hn||!i)return -EINVAL;for(uint32_t j=0;j<h->nb_nodes;j++){if(!peer_meta(h,j))continue;if(!strcmp(peer_meta(h,j)->node_name,hn)){*i=j;return 0;}}return -ENOENT; }
+{ if(!h||!hn||!i)return -EINVAL;for(uint32_t j=0;j<h->nb_nodes;j++){if(!strcmp(h->peers[j].node_name,hn)){*i=j;return 0;}}return -ENOENT; }
 void rte_ub_ring_fini(struct rte_ub_ring_handle *h) {
 	if (!h) return;
-	for (uint32_t i=0;i<UB_RING_MAX_NODES;i++){if(i==h->my_node_index)continue;if(h->peers[i].shm_base){size_t sz=peer_meta(h,i)?peer_meta(h,i)->total_size:0;ubsmem_shmem_unmap(h->peers[i].shm_base,sz);}}
-	if(h->role==UB_RING_ROLE_PROVIDER&&h->peers[h->my_node_index].shm_base){ubsmem_shmem_unmap(h->peers[h->my_node_index].shm_base,peer_meta(h,h->my_node_index)->total_size);char nm[128],my[MAX_HOST_NAME_DESC_LENGTH];if(!gethostname(my,sizeof(my))){snprintf(nm,128,"%s_%s",h->shm_prefix,my);ubsmem_shmem_deallocate(nm);}}
+	for (uint32_t i=0;i<UB_RING_MAX_NODES;i++){if(i==h->my_node_index)continue;if(h->peers[i].shm_base)ubsmem_shmem_unmap(h->peers[i].shm_base,h->peers[i].total_size);}
+	if(h->role==UB_RING_ROLE_PROVIDER&&h->peers[h->my_node_index].shm_base){ubsmem_shmem_unmap(h->peers[h->my_node_index].shm_base,h->peers[h->my_node_index].total_size);char nm[128],my[MAX_HOST_NAME_DESC_LENGTH];if(!gethostname(my,sizeof(my))){snprintf(nm,128,"%s_%s",h->shm_prefix,my);ubsmem_shmem_deallocate(nm);}}
 	if(h->data_rings){for(uint32_t i=0;i<UB_RING_MAX_NODES;i++)if(h->data_rings[i])rte_ring_free(h->data_rings[i]);rte_free(h->data_rings);}
 	if(h->shadow_tx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_tx[q]);rte_free(h->shadow_tx);}
 	if(h->shadow_rx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_rx[q]);rte_free(h->shadow_rx);}
