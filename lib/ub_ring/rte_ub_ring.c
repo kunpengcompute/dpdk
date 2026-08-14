@@ -99,7 +99,9 @@ sync_peer_data_ring(struct rte_ub_ring_handle *h, uint32_t i)
 	h->peers[i].data_elt_size = m->data_elt_size;
 	h->peers[i].return_ring = (struct rte_ring *)((char *)h->peers[i].shm_base + m->data_ring_offset);
 	size_t rsz = rte_ring_get_memsize(m->data_nb_bufs);
-	h->peers[i].data_buf_area = (char *)h->peers[i].return_ring + rsz;
+	/* same 128B alignment as user_init: both sides must agree */
+	h->peers[i].data_buf_area = (void *)RTE_ALIGN(
+		(uintptr_t)((char *)h->peers[i].return_ring + rsz), 128);
 	h->peers[i].data_buf_end   = (char *)h->peers[i].data_buf_area + (size_t)m->data_nb_bufs * m->data_elt_size;
 }
 
@@ -192,7 +194,7 @@ rte_ub_ring_provider_init(const char **pn, uint32_t np, const char **un, uint32_
 	for(uint32_t i=0;i<nu;i++){strncpy(a.hosts[np+i].host_name,un[i],MAX_HOST_NAME_DESC_LENGTH-1);a.hosts[np+i].affinity=true;}
 	rc=ubsmem_create_region(reg,0,&a);if(rc!=UBSM_OK&&rc!=UBSM_ERR_ALREADY_EXIST){UB_RING_LOG(ERR,"region:%s(%d)",ubs_strerror(rc),rc);goto fail_ub;}
 	snprintf(nm,128,"%s_%s",pre,my); ubsmem_shmem_deallocate(nm);
-	if((rc=ubsmem_shmem_allocate(reg,nm,sz,0600,UBSM_FLAG_NONCACHE|UBSM_FLAG_WR_DELAY_COMP))){UB_RING_LOG(ERR,"alloc:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
+	if((rc=ubsmem_shmem_allocate(reg,nm,sz,0600,UBSM_FLAG_ONLY_IMPORT_NONCACHE|UBSM_FLAG_WR_DELAY_COMP))){UB_RING_LOG(ERR,"alloc:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
 	if((rc=ubsmem_shmem_map(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,nm,0,&sh))){UB_RING_LOG(ERR,"map:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
 	memset(sh,0,sz); h->peers[mi].shm_base=sh;
 	ms=cms(nq); rs=crs(qd); ras=cras(nq,rs);
@@ -234,6 +236,9 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 	char my[MAX_HOST_NAME_DESC_LENGTH]; ubsmem_options_t o; ubsmem_region_attributes_t a;
 	uint32_t mi, tot; int rc;
 	if (!pn||!np||np>UB_RING_MAX_NODES||nu>UB_RING_MAX_NODES||!reg||!pre||!elt){rte_errno=EINVAL;return NULL;}
+	/* element size as a 128B multiple: every buffer starts on a
+	 * 128B boundary (given the 128B-aligned buffer area start) */
+	elt = RTE_ALIGN(elt, 128);
 	struct rte_ub_ring_handle *h=rte_zmalloc(NULL,sizeof(*h),0); if(!h)return NULL;
 	h->role=UB_RING_ROLE_USER; snprintf(h->region_name,64,"%s",reg); snprintf(h->shm_prefix,64,"%s",pre);
 	if (resolve_index(pn,np,un,nu,&mi,&tot)<0)goto fail;
@@ -265,12 +270,15 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		if (wait_meta(pm)<0){UB_RING_LOG(ERR,"meta timeout %s",pn2);goto fail_reg;}
 		h->peers[pi].data_elt_size=elt;
 
-		/* compute data ring layout: return ring + buffer area */
+		/* compute data ring layout: return ring + buffer area.
+		 * buffer area starts 128B-aligned and each element is a
+		 * 128B multiple, so every buffer begins on a 128B boundary
+		 * (reserve up to 127B for the area alignment) */
 		uint64_t dr_off=pm->ring_area_offset+pm->ring_area_size;
 		uint64_t dr_sz=pm->total_size-dr_off;
-		uint32_t mx=(uint32_t)((dr_sz-sizeof(struct rte_ring))/(8+elt));
+		uint32_t mx=(uint32_t)((dr_sz-sizeof(struct rte_ring)-128)/(8+elt));
 		mx=rte_align32prevpow2(mx);
-		while(rte_ring_get_memsize(mx)+(size_t)mx*elt>dr_sz)mx/=2;
+		while(rte_ring_get_memsize(mx)+128+(size_t)mx*elt>dr_sz)mx/=2;
 		if(mx<2){UB_RING_LOG(ERR,"data ring too small");goto fail_reg;}
 		size_t rrs=rte_ring_get_memsize(mx);
 		void*drb=(char*)psh+dr_off;
@@ -279,7 +287,7 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		/* return ring: MP (providers enqueue), SC (user drain) */
 		rc=rte_ring_init(rr,rn,mx,RING_F_SC_DEQ);
 		if(rc<0){UB_RING_LOG(ERR,"return ring init fail:%d",rc);goto fail_reg;}
-		void*ba=(char*)drb+rrs;
+		void*ba=(void*)RTE_ALIGN((uintptr_t)((char*)drb+rrs),128);
 		h->peers[pi].return_ring=rr;
 		h->peers[pi].data_buf_area=ba;
 		h->peers[pi].data_buf_end=(char*)ba+(size_t)mx*elt;
