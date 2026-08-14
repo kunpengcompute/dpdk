@@ -287,13 +287,17 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		/* create LOCAL data ring
 		 * MP enqueue (flush thread collect/free_buf AND sender
 		 * threads' eth_tx failure path all enqueue concurrently)
-		 * MC dequeue (multiple sender threads: alloc_buf) */
+		 * MC dequeue (multiple sender threads: alloc_buf).
+		 * Depth = mx (the shm buffer count) so every buffer can
+		 * be in flight at once */
 		char dn[64];snprintf(dn,64,"data_%s",pn2);
-		h->data_rings[pi]=rte_ring_create(dn,1024,rte_socket_id(),0);
+		h->data_rings[pi]=rte_ring_create(dn,mx,rte_socket_id(),0);
 		if(!h->data_rings[pi]){UB_RING_LOG(ERR,"local data ring fail");goto fail_reg;}
 
 		/* populate: enqueue all free offsets to local data ring */
-		for(uint32_t idx=0;idx<mx;idx++){void*e=(void*)(uintptr_t)(idx*elt);rte_ring_enqueue_burst(h->data_rings[pi],&e,1,NULL);}
+		for(uint32_t idx=0;idx<mx;idx+=64){void*e[64];uint32_t n=RTE_MIN(64u,mx-idx);
+			for(uint32_t k=0;k<n;k++)e[k]=(void*)(uintptr_t)((idx+k)*elt);
+			rte_ring_enqueue_burst(h->data_rings[pi],e,n,NULL);}
 
 		pm->data_ring_offset=dr_off;
 		pm->data_elt_size=elt; pm->data_nb_bufs=mx;
@@ -428,8 +432,9 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 	h->shadow_rx = rte_zmalloc(NULL, h->total_queues * sizeof(void*), 0);
 	if (!h->shadow_tx || !h->shadow_rx) return -ENOMEM;
 	for (uint32_t q = 0; q < h->total_queues; q++) {
-		char n[64]; snprintf(n,64,"stx%u",q); h->shadow_tx[q]=rte_ring_create(n,1024,rte_socket_id(),RING_F_SC_DEQ);
-		snprintf(n,64,"srx%u",q); h->shadow_rx[q]=rte_ring_create(n,1024,rte_socket_id(),RING_F_SC_DEQ);
+		/* 1M-deep shadow rings: senders may run far ahead of flush */
+		char n[64]; snprintf(n,64,"stx%u",q); h->shadow_tx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SC_DEQ);
+		snprintf(n,64,"srx%u",q); h->shadow_rx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SC_DEQ);
 		if (!h->shadow_tx[q] || !h->shadow_rx[q]) return -ENOMEM;
 	}
 	h->mpmc_enabled = true; return 0;

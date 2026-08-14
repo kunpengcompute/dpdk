@@ -110,7 +110,7 @@ int main(int argc, char **argv)
 
 	const char *pn[] = {"master"}, *un[] = {"worker1"};
 	struct rte_ub_ring_handle *h = rte_ub_ring_provider_init(
-		pn, 1, un, 1, "region1", "ubring", 1UL*1024*1024*1024, g_nq, 1024);
+		pn, 1, un, 1, "region1", "ubring", 4UL*1024*1024*1024, g_nq, 1024*1024);
 	int pid = rte_eth_ub_ring_attach("server_eth", h);
 	struct rte_eth_conf c = { .rxmode = { .max_lro_pkt_size = RTE_ETHER_MAX_LEN } };
 	rte_eth_dev_configure(pid, g_nq, g_nq, &c);

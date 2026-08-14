@@ -162,14 +162,19 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 		/* rte_mempool_get_bulk returns 0 on success, <0 on error */
 		if (rte_mempool_get_bulk(d, o, n) < 0)
 			continue; /* raced with a concurrent consumer */
-		for (unsigned int i = 0; i < n; i++)
-			rte_ub_ring_free_buf(h, o[i]);
+		/* one bulk MP enqueue per drain pass instead of one CAS
+		 * per buffer (workers would serialize on the return ring) */
+		rte_ub_ring_return_burst(h, o, n);
 	}
 }
 
 static struct rte_mempool *mkp(void)
-{ /* MP/MC: multiple worker threads put (pktmbuf_free) and get (drain) */
-	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",1024,64,0,0,NULL,NULL,NULL,NULL,rte_socket_id(),0);
+{ /* MP/MC: multiple worker threads put (pktmbuf_free) and get (drain).
+   * cache_size=0: this pool is only a "free → drain" staging area;
+   * a per-lcore cache would strand up to 64 mbufs per worker (avail_count
+   * only sees the ring), stalling the buffer return path.
+   * 64K objects: more than every in-flight buffer can be freed at once */
+	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",64*1024,0,0,0,NULL,NULL,NULL,NULL,rte_socket_id(),0);
 	if (mp) {
 		/* drain all placeholder objects so only freed mbufs are
 		 * ever retrieved. get_bulk returns 0 on success, <0 on error */
