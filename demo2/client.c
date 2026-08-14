@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Client — N send lcores + 1 flush lcore, each sender counts its own pps.
  * Run: ./client --no-huge -l 1-5 --ns=2 --pktlen=500
- *      ns     = number of sender lcores
+ *      ns     = number of sender lcores (any value vs server queues:
+ *               ns <= nq → contiguous queue blocks, RR within block;
+ *               ns >  nq → sender s shares queue s % nq)
  *      pktlen = packet payload size (<= RTE_MBUF_DEFAULT_BUF_SIZE - headroom)
  */
 #include <stdio.h>
@@ -149,10 +151,6 @@ int main(int argc, char **argv)
 
 	struct rte_eth_conf c = { .rxmode = { .max_lro_pkt_size = RTE_ETHER_MAX_LEN } };
 	uint32_t tq = rte_ub_ring_get_total_queues(h);
-	if (ns > tq) {
-		fprintf(stderr, "ns=%u > queues=%u\n", ns, tq);
-		return 1;
-	}
 	rte_eth_dev_configure(pid, tq, tq, &c);
 	rte_eth_dev_start(pid);
 
@@ -172,20 +170,36 @@ int main(int argc, char **argv)
 		0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	if (!mp) { fprintf(stderr, "pool create fail\n"); return 1; }
 
-	/* split queues evenly (contiguous blocks) across senders:
-	 * first `rem` senders take one extra queue */
-	uint32_t base = tq / ns, rem = tq % ns;
+	/* each queue must get >= NP/tq packets: per-queue burst rounds */
+	uint32_t R = (NP / tq + BS - 1) / BS;
 	struct sarg sa[RTE_MAX_LCORE];
-	for (uint32_t s = 0; s < ns; s++) {
-		sa[s].pid = pid;
-		sa[s].q0 = s * base + RTE_MIN(s, rem);
-		sa[s].nq_own = base + (s < rem);
-		/* each queue must get >= NP/tq packets: per-queue rounds,
-		 * times this sender's queue count (RR splits evenly) */
-		sa[s].rounds = sa[s].nq_own * ((NP / tq + BS - 1) / BS);
-		sa[s].pkt_len = pkt_len;
-		sa[s].mp = mp;
-		rte_eal_remote_launch(sender, &sa[s], lc[1 + s]);
+	if (ns <= tq) {
+		/* contiguous even split: first `rem` senders take one
+		 * extra queue, RR over the block */
+		uint32_t base = tq / ns, rem = tq % ns;
+		for (uint32_t s = 0; s < ns; s++) {
+			sa[s].pid = pid;
+			sa[s].q0 = s * base + RTE_MIN(s, rem);
+			sa[s].nq_own = base + (s < rem);
+			sa[s].rounds = sa[s].nq_own * R;
+			sa[s].pkt_len = pkt_len;
+			sa[s].mp = mp;
+			rte_eal_remote_launch(sender, &sa[s], lc[1 + s]);
+		}
+	} else {
+		/* more senders than queues: sender s shares queue s % tq,
+		 * the queue's rounds split evenly among its senders */
+		for (uint32_t s = 0; s < ns; s++) {
+			uint32_t q = s % tq;
+			uint32_t m = (ns - q + tq - 1) / tq; /* senders on q */
+			sa[s].pid = pid;
+			sa[s].q0 = q;
+			sa[s].nq_own = 1;
+			sa[s].rounds = (R + m - 1) / m;
+			sa[s].pkt_len = pkt_len;
+			sa[s].mp = mp;
+			rte_eal_remote_launch(sender, &sa[s], lc[1 + s]);
+		}
 	}
 	for (uint32_t s = 0; s < ns; s++)
 		rte_eal_wait_lcore(lc[1 + s]);

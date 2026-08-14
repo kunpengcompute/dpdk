@@ -268,8 +268,9 @@ void rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t qid);
 
 /**
  * Flush TX for all queues, retrying until every shadow_tx ring is
- * empty. Use at teardown (after the flush worker stopped) while the
- * peer is still consuming. Single-threaded caller only.
+ * empty; gives up with a warning after ~1s without progress (peer
+ * done consuming). Use at teardown (after the flush worker stopped).
+ * Single-threaded caller only.
  */
 void rte_ub_ring_flush_tx_all(struct rte_ub_ring_handle *h);
 
