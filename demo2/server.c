@@ -49,7 +49,11 @@ static int worker(void *a)
 	uint64_t rx_bytes = 0;
 	uint64_t t0 = 0, t1;
 
-	while (rx < NP / g_nq) {
+	/* client delivers whole BS-bursts per queue; align the target up
+	 * to a burst multiple so every queue reports the same count */
+	uint32_t target = ((NP / g_nq + BS - 1) / BS) * BS;
+
+	while (rx < target) {
 		uint16_t n = rte_eth_rx_burst(ta->pid, ta->qid, pkts, BS);
 		if (n == 0)
 			continue;

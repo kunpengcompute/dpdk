@@ -267,6 +267,13 @@ uint16_t rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h,
 void rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t qid);
 
 /**
+ * Flush TX for all queues, retrying until every shadow_tx ring is
+ * empty. Use at teardown (after the flush worker stopped) while the
+ * peer is still consuming. Single-threaded caller only.
+ */
+void rte_ub_ring_flush_tx_all(struct rte_ub_ring_handle *h);
+
+/**
  * Flush RX: move all from real rx_ring[qid] → shadow_rx[qid].
  * Single-threaded caller only.
  */

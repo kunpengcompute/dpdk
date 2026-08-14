@@ -17,7 +17,7 @@
 #include <rte_ub_ring.h>
 #include <rte_eth_ub_ring.h>
 
-#define NP      (1024*1024)
+#define NP      (1024*1024 + 1024)
 #define BS      32
 
 static volatile int g_running = 1;
@@ -189,15 +189,20 @@ int main(int argc, char **argv)
 	for (uint32_t s = 0; s < ns; s++)
 		rte_eal_wait_lcore(lc[1 + s]);
 
-	/* final flush: drain any packets still in shadow rings */
-	for (uint32_t q = 0; q < g_nb_q; q++) {
-		rte_ub_ring_flush_tx(g_h, q);
-		rte_ub_ring_flush_rx(g_h, q);
-	}
-	rte_ub_ring_collect(g_h);
-
+	/* stop the flush worker FIRST: shadow rings are SC_DEQ and shm
+	 * rings are SP_ENQ — a concurrent final flush from main would
+	 * corrupt the rings and lose the last packets some server
+	 * workers are still waiting for */
 	g_running = 0;
 	rte_eal_wait_lcore(lc[0]);
+
+	/* final flush alone: retry until every shadow ring is empty (the
+	 * server keeps consuming until its workers finish) */
+	rte_ub_ring_flush_tx_all(g_h);
+	for (uint32_t q = 0; q < g_nb_q; q++)
+		rte_ub_ring_flush_rx(g_h, q);
+	rte_ub_ring_collect(g_h);
+
 	rte_eth_dev_stop(pid); rte_eth_dev_close(pid); rte_ub_ring_fini(h);
 	rte_mempool_free(mp);
 	rte_eal_cleanup();

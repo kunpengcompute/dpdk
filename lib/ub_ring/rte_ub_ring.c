@@ -465,6 +465,23 @@ void rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 		}
 	}
 }
+
+void rte_ub_ring_flush_tx_all(struct rte_ub_ring_handle *h)
+{
+	if (!h || !h->mpmc_enabled) return;
+	/* the peer keeps consuming until its workers finish, so the tx
+	 * rings keep draining and this loop makes progress */
+	for (;;) {
+		uint32_t pending = 0;
+		for (uint32_t q = 0; q < h->total_queues; q++) {
+			rte_ub_ring_flush_tx(h, q);
+			pending += rte_ring_count(h->shadow_tx[q]);
+		}
+		if (pending == 0)
+			break;
+		rte_pause();
+	}
+}
 void rte_ub_ring_flush_rx(struct rte_ub_ring_handle *h, uint32_t q) {
 	if (!h || !h->mpmc_enabled || q >= h->total_queues) return;
 	void *bufs[64]; uint16_t n;
