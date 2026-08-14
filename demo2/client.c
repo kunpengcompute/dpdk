@@ -97,7 +97,6 @@ static int sender(void *a)
 			uint16_t s = rte_eth_tx_burst(sa->pid, q,
 				&burst[sent], nb_built - sent);
 			if (s == 0) {
-				rte_delay_us(100);
 				continue;
 			}
 			sent += s;
@@ -164,11 +163,13 @@ int main(int argc, char **argv)
 	rte_eal_remote_launch(flush_worker, NULL, lc[0]);
 
 	/* each sender holds BS mbufs for the whole run (TX ownership
-	 * transferred, local mbufs never returned) → pool = ns * BS */
+	 * transferred, local mbufs never returned) → pool = ns * BS.
+	 * cache_size=0: senders allocate the whole batch once in phase 1,
+	 * and a per-lcore cache would refill cache_size+1 objects and
+	 * strand them, starving the other senders */
 	uint32_t pool_n = ns * BS;
 	struct rte_mempool *mp = rte_pktmbuf_pool_create("tx", pool_n,
-		RTE_MIN(32u, pool_n / 2), 0, RTE_MBUF_DEFAULT_BUF_SIZE,
-		rte_socket_id());
+		0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	if (!mp) { fprintf(stderr, "pool create fail\n"); return 1; }
 
 	/* split queues evenly (contiguous blocks) across senders:
