@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Server — 4 workers, each counts its own packets and pps.
- * Run: ./server --no-huge -l 1-5
+ * Server — N workers (one per queue), each counts its own packets and pps.
+ * Run: ./server --no-huge -l 1-5 --nq=4   (nq = number of queues/workers)
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <rte_eal.h>
 #include <rte_launch.h>
@@ -13,9 +14,25 @@
 #include <rte_ub_ring.h>
 #include <rte_eth_ub_ring.h>
 
-#define NQ 4
 #define NP (1024*1024)
 #define BS 32
+
+static uint32_t g_nq;
+
+static uint32_t app_opt_uint(int argc, char **argv, const char *opt,
+			     uint32_t def)
+{
+	for (int i = 1; i < argc; i++) {
+		size_t l = strlen(opt);
+		if (strncmp(argv[i], opt, l) == 0 && argv[i][l] == '=') {
+			char *end = NULL;
+			unsigned long v = strtoul(argv[i] + l + 1, &end, 0);
+			if (end && *end == '\0')
+				return (uint32_t)v;
+		}
+	}
+	return def;
+}
 
 struct targ { int pid; uint32_t qid; };
 
@@ -26,7 +43,7 @@ static int worker(void *a)
 	uint32_t rx = 0;
 	uint64_t t0 = 0, t1;
 
-	while (rx < NP / NQ) {
+	while (rx < NP / g_nq) {
 		uint16_t n = rte_eth_rx_burst(ta->pid, ta->qid, pkts, BS);
 		if (n == 0)
 			continue;
@@ -47,27 +64,37 @@ static int worker(void *a)
 int main(int argc, char **argv)
 {
 	rte_eal_init(argc, argv);
+	g_nq = app_opt_uint(argc, argv, "--nq", 4);
+	if (g_nq < 1 || g_nq > UB_RING_MAX_QUEUES) {
+		fprintf(stderr, "bad --nq\n");
+		return 1;
+	}
+
 	unsigned int ml = rte_get_main_lcore();
-	unsigned int lc[8]; unsigned int nl = 0;
+	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;
 	for (unsigned int l = 0; l < RTE_MAX_LCORE; l++)
 		if (rte_lcore_is_enabled(l) && l != ml) lc[nl++] = l;
+	if (g_nq > nl) {
+		fprintf(stderr, "need %u worker lcores (have %u)\n", g_nq, nl);
+		return 1;
+	}
 
-	printf("\n===== Server (%u queues, %u workers) =====\n\n", NQ, nl);
+	printf("\n===== Server (%u queues, %u workers) =====\n\n", g_nq, nl);
 
 	const char *pn[] = {"master"}, *un[] = {"worker1"};
 	struct rte_ub_ring_handle *h = rte_ub_ring_provider_init(
-		pn, 1, un, 1, "region1", "ubring", 1UL*1024*1024*1024, NQ, 1024);
+		pn, 1, un, 1, "region1", "ubring", 1UL*1024*1024*1024, g_nq, 1024);
 	int pid = rte_eth_ub_ring_attach("server_eth", h);
 	struct rte_eth_conf c = { .rxmode = { .max_lro_pkt_size = RTE_ETHER_MAX_LEN } };
-	rte_eth_dev_configure(pid, NQ, NQ, &c);
+	rte_eth_dev_configure(pid, g_nq, g_nq, &c);
 	rte_eth_dev_start(pid);
 
-	struct targ ta[NQ];
-	for (uint32_t q = 0; q < NQ; q++) {
+	struct targ ta[UB_RING_MAX_QUEUES];
+	for (uint32_t q = 0; q < g_nq; q++) {
 		ta[q] = (struct targ){ pid, q };
 		rte_eal_remote_launch(worker, &ta[q], lc[q]);
 	}
-	for (uint32_t q = 0; q < NQ; q++)
+	for (uint32_t q = 0; q < g_nq; q++)
 		rte_eal_wait_lcore(lc[q]);
 
 	rte_eth_dev_stop(pid); rte_eth_dev_close(pid); rte_ub_ring_fini(h);

@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Client — 2 send lcores + 1 flush lcore, each sender counts its own pps.
- * Run: ./client --no-huge -l 1-4
+ * Client — N send lcores + 1 flush lcore, each sender counts its own pps.
+ * Run: ./client --no-huge -l 1-5 --ns=2 --pktlen=500
+ *      ns     = number of sender lcores
+ *      pktlen = packet payload size (<= RTE_MBUF_DEFAULT_BUF_SIZE - headroom)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,13 +17,27 @@
 #include <rte_ub_ring.h>
 #include <rte_eth_ub_ring.h>
 
-#define NQ      4
 #define NP      (1024*1024)
 #define BS      32
 
 static volatile int g_running = 1;
 static struct rte_ub_ring_handle *g_h;
 static uint32_t g_nb_q;
+
+static uint32_t app_opt_uint(int argc, char **argv, const char *opt,
+			     uint32_t def)
+{
+	for (int i = 1; i < argc; i++) {
+		size_t l = strlen(opt);
+		if (strncmp(argv[i], opt, l) == 0 && argv[i][l] == '=') {
+			char *end = NULL;
+			unsigned long v = strtoul(argv[i] + l + 1, &end, 0);
+			if (end && *end == '\0')
+				return (uint32_t)v;
+		}
+	}
+	return def;
+}
 
 static int flush_worker(void *arg)
 {
@@ -37,30 +53,31 @@ static int flush_worker(void *arg)
 	return 0;
 }
 
-struct sarg { int pid; uint32_t q0, q1; struct rte_mempool *mp; };
-
-#define PKT_LEN 500
+struct sarg { int pid; uint32_t q0, qstride, nq_own, rounds, pkt_len;
+	struct rte_mempool *mp; };
 
 static int sender(void *a)
 {
 	struct sarg *sa = a;
 	struct rte_mbuf *burst[BS];
-	uint32_t rounds = NP / 2 / BS;
 	uint32_t sent_total = 0;
+
+	if (sa->nq_own == 0)
+		return 0;
 
 	/* phase 1 (untimed): build one batch of packets, reused every round */
 	for (int i = 0; i < BS; i++) {
 		struct rte_mbuf *m = rte_pktmbuf_alloc(sa->mp);
 		if (!m) break;
-		rte_pktmbuf_append(m, PKT_LEN);
-		memset(rte_pktmbuf_mtod(m, char *), 0x55, PKT_LEN);
+		rte_pktmbuf_append(m, sa->pkt_len);
+		memset(rte_pktmbuf_mtod(m, char *), 0x55, sa->pkt_len);
 		burst[i] = m;
 	}
 
 	/* phase 2 (timed): send the same batch round after round */
 	uint64_t t0 = rte_rdtsc();
-	for (uint32_t r = 0; r < rounds; r++) {
-		uint32_t q = (r & 1) ? sa->q1 : sa->q0;
+	for (uint32_t r = 0; r < sa->rounds; r++) {
+		uint32_t q = sa->q0 + (r % sa->nq_own) * sa->qstride;
 
 		uint16_t sent = 0;
 		while (sent < BS) {
@@ -82,7 +99,7 @@ static int sender(void *a)
 
 	double secs = (double)(t1 - t0) / rte_get_tsc_hz();
 	double mpps = sent_total / secs / 1e6;
-	double mbps = mpps * PKT_LEN * 8;
+	double mbps = mpps * sa->pkt_len * 8;
 	printf("[Cli lc%u] %u pkts, %.3fs, %.2f Mpps, %.2f Mbps\n",
 		rte_lcore_id(), sent_total, secs, mpps, mbps);
 	return 0;
@@ -91,14 +108,25 @@ static int sender(void *a)
 int main(int argc, char **argv)
 {
 	rte_eal_init(argc, argv);
+	uint32_t ns = app_opt_uint(argc, argv, "--ns", 2);
+	if (ns < 1) { fprintf(stderr, "bad --ns\n"); return 1; }
+	uint32_t pkt_len = app_opt_uint(argc, argv, "--pktlen", 500);
+	if (pkt_len < 1 ||
+	    pkt_len > RTE_MBUF_DEFAULT_BUF_SIZE - RTE_PKTMBUF_HEADROOM) {
+		fprintf(stderr, "bad --pktlen (1..%u)\n",
+			RTE_MBUF_DEFAULT_BUF_SIZE - RTE_PKTMBUF_HEADROOM);
+		return 1;
+	}
+
 	unsigned int ml = rte_get_main_lcore();
-	unsigned int lc[8]; unsigned int nl = 0;
+	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;
 	for (unsigned int l = 0; l < RTE_MAX_LCORE; l++)
 		if (rte_lcore_is_enabled(l) && l != ml) lc[nl++] = l;
-	if (nl < 3) { fprintf(stderr,"need 3 worker lcores\n"); return 1; }
-
-	printf("\n===== Client (%u queues, flush=lc%u, senders=lc%u,lc%u) =====\n\n",
-		NQ, lc[0], lc[1], lc[2]);
+	if (nl < ns + 1) {
+		fprintf(stderr, "need %u worker lcores (flush + %u senders)\n",
+			ns + 1, ns);
+		return 1;
+	}
 
 	const char *pn[] = {"master"}, *un[] = {"worker1"};
 	uint32_t elt = sizeof(struct rte_mbuf) + RTE_MBUF_DEFAULT_BUF_SIZE;
@@ -109,8 +137,15 @@ int main(int argc, char **argv)
 
 	struct rte_eth_conf c = { .rxmode = { .max_lro_pkt_size = RTE_ETHER_MAX_LEN } };
 	uint32_t tq = rte_ub_ring_get_total_queues(h);
+	if (ns > tq) {
+		fprintf(stderr, "ns=%u > queues=%u\n", ns, tq);
+		return 1;
+	}
 	rte_eth_dev_configure(pid, tq, tq, &c);
 	rte_eth_dev_start(pid);
+
+	printf("\n===== Client (%u queues, %u sender lcores, %uB pkts, flush=lc%u) =====\n\n",
+		tq, ns, pkt_len, lc[0]);
 
 	g_h = h; g_nb_q = tq;
 	rte_eal_remote_launch(flush_worker, NULL, lc[0]);
@@ -118,10 +153,21 @@ int main(int argc, char **argv)
 	struct rte_mempool *mp = rte_pktmbuf_pool_create("tx", 256, 32, 0,
 		RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 
-	struct sarg s0 = { pid, 0, 1, mp }, s1 = { pid, 2, 3, mp };
-	rte_eal_remote_launch(sender, &s0, lc[1]);
-	rte_eal_remote_launch(sender, &s1, lc[2]);
-	rte_eal_wait_lcore(lc[1]); rte_eal_wait_lcore(lc[2]);
+	/* round-robin queues across senders: sender s gets {s, s+ns, ...} */
+	struct sarg sa[RTE_MAX_LCORE];
+	for (uint32_t s = 0; s < ns; s++) {
+		sa[s].pid = pid;
+		sa[s].q0 = s;
+		sa[s].qstride = ns;
+		sa[s].nq_own = (tq - s + ns - 1) / ns;
+		/* ceil(NP/ns/BS): total sent >= NP even if ns !| NP */
+		sa[s].rounds = (NP / ns + BS - 1) / BS;
+		sa[s].pkt_len = pkt_len;
+		sa[s].mp = mp;
+		rte_eal_remote_launch(sender, &sa[s], lc[1 + s]);
+	}
+	for (uint32_t s = 0; s < ns; s++)
+		rte_eal_wait_lcore(lc[1 + s]);
 
 	/* final flush: drain any packets still in shadow rings */
 	for (uint32_t q = 0; q < g_nb_q; q++) {
