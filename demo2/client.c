@@ -24,14 +24,19 @@ static volatile int g_running = 1;
 static struct rte_ub_ring_handle *g_h;
 static uint32_t g_nb_q;
 
-static uint32_t app_opt_uint(int argc, char **argv, const char *opt,
+/* parse "--opt=N" BEFORE eal_init and strip it from argv, so EAL's
+ * getopt never sees it (would fail with "unrecognized option") */
+static uint32_t app_opt_uint(int *argc, char **argv, const char *opt,
 			     uint32_t def)
 {
-	for (int i = 1; i < argc; i++) {
+	for (int i = 1; i < *argc; i++) {
 		size_t l = strlen(opt);
 		if (strncmp(argv[i], opt, l) == 0 && argv[i][l] == '=') {
 			char *end = NULL;
 			unsigned long v = strtoul(argv[i] + l + 1, &end, 0);
+			for (int j = i; j < *argc - 1; j++)
+				argv[j] = argv[j + 1];
+			(*argc)--;
 			if (end && *end == '\0')
 				return (uint32_t)v;
 		}
@@ -107,16 +112,16 @@ static int sender(void *a)
 
 int main(int argc, char **argv)
 {
-	rte_eal_init(argc, argv);
-	uint32_t ns = app_opt_uint(argc, argv, "--ns", 2);
+	uint32_t ns = app_opt_uint(&argc, argv, "--ns", 2);
 	if (ns < 1) { fprintf(stderr, "bad --ns\n"); return 1; }
-	uint32_t pkt_len = app_opt_uint(argc, argv, "--pktlen", 500);
+	uint32_t pkt_len = app_opt_uint(&argc, argv, "--pktlen", 500);
 	if (pkt_len < 1 ||
 	    pkt_len > RTE_MBUF_DEFAULT_BUF_SIZE - RTE_PKTMBUF_HEADROOM) {
 		fprintf(stderr, "bad --pktlen (1..%u)\n",
 			RTE_MBUF_DEFAULT_BUF_SIZE - RTE_PKTMBUF_HEADROOM);
 		return 1;
 	}
+	rte_eal_init(argc, argv);
 
 	unsigned int ml = rte_get_main_lcore();
 	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;

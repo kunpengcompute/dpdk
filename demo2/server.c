@@ -19,14 +19,19 @@
 
 static uint32_t g_nq;
 
-static uint32_t app_opt_uint(int argc, char **argv, const char *opt,
+/* parse "--opt=N" BEFORE eal_init and strip it from argv, so EAL's
+ * getopt never sees it (would fail with "unrecognized option") */
+static uint32_t app_opt_uint(int *argc, char **argv, const char *opt,
 			     uint32_t def)
 {
-	for (int i = 1; i < argc; i++) {
+	for (int i = 1; i < *argc; i++) {
 		size_t l = strlen(opt);
 		if (strncmp(argv[i], opt, l) == 0 && argv[i][l] == '=') {
 			char *end = NULL;
 			unsigned long v = strtoul(argv[i] + l + 1, &end, 0);
+			for (int j = i; j < *argc - 1; j++)
+				argv[j] = argv[j + 1];
+			(*argc)--;
 			if (end && *end == '\0')
 				return (uint32_t)v;
 		}
@@ -41,6 +46,7 @@ static int worker(void *a)
 	struct targ *ta = a;
 	struct rte_mbuf *pkts[BS];
 	uint32_t rx = 0;
+	uint64_t rx_bytes = 0;
 	uint64_t t0 = 0, t1;
 
 	while (rx < NP / g_nq) {
@@ -49,26 +55,29 @@ static int worker(void *a)
 			continue;
 		if (rx == 0)
 			t0 = rte_rdtsc();
-		for (uint16_t i = 0; i < n; i++)
+		for (uint16_t i = 0; i < n; i++) {
+			rx_bytes += pkts[i]->pkt_len;
 			rte_pktmbuf_free(pkts[i]);
+		}
 		rx += n;
 	}
 	t1 = rte_rdtsc();
 	double secs = (double)(t1 - t0) / rte_get_tsc_hz();
 	double mpps = rx / secs / 1e6;
-	printf("[Srv q%u] %u pkts, %.3fs, %.2f Mpps, %.2f Mbps\n",
-		ta->qid, rx, secs, mpps, mpps * 500 * 8);
+	double mbps = rx_bytes / secs * 8 / 1e6;
+	printf("[Srv q%u] %u pkts (%lu B), %.3fs, %.2f Mpps, %.2f Mbps\n",
+		ta->qid, rx, rx_bytes, secs, mpps, mbps);
 	return 0;
 }
 
 int main(int argc, char **argv)
 {
-	rte_eal_init(argc, argv);
-	g_nq = app_opt_uint(argc, argv, "--nq", 4);
+	g_nq = app_opt_uint(&argc, argv, "--nq", 4);
 	if (g_nq < 1 || g_nq > UB_RING_MAX_QUEUES) {
 		fprintf(stderr, "bad --nq\n");
 		return 1;
 	}
+	rte_eal_init(argc, argv);
 
 	unsigned int ml = rte_get_main_lcore();
 	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;
