@@ -203,7 +203,12 @@ rte_ub_ring_provider_init(const char **pn, uint32_t np, const char **un, uint32_
 	for(uint32_t i=0;i<nu;i++){strncpy(a.hosts[np+i].host_name,un[i],MAX_HOST_NAME_DESC_LENGTH-1);a.hosts[np+i].affinity=true;}
 	rc=ubsmem_create_region(reg,0,&a);if(rc!=UBSM_OK&&rc!=UBSM_ERR_ALREADY_EXIST){UB_RING_LOG(ERR,"region:%s(%d)",ubs_strerror(rc),rc);goto fail_ub;}
 	snprintf(nm,128,"%s_%s",pre,my); ubsmem_shmem_deallocate(nm);
-	if((rc=ubsmem_shmem_allocate(reg,nm,sz,0600,UBSM_FLAG_ONLY_IMPORT_NONCACHE|UBSM_FLAG_WR_DELAY_COMP))){UB_RING_LOG(ERR,"alloc:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
+	ubs_mem_provider_t src_loc;
+	strncpy(src_loc.host_name, my, MAX_HOST_NAME_DESC_LENGTH - 1);
+	src_loc.socket_id = 0;
+	src_loc.numa_id   = 0;
+	src_loc.port_id   = UINT32_MAX;
+	if((rc=ubsmem_shmem_allocate_with_provider(&src_loc,nm,sz,0600,UBSM_FLAG_ONLY_IMPORT_NONCACHE|UBSM_FLAG_WR_DELAY_COMP|UBSM_FLAG_MMAP_HUGETLB_PMD))){UB_RING_LOG(ERR,"alloc:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
 	if((rc=ubsmem_shmem_map(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,nm,0,&sh))){UB_RING_LOG(ERR,"map:%s(%d)",ubs_strerror(rc),rc);goto fail_reg;}
 	memset(sh,0,sz); h->peers[mi].shm_base=sh;
 	h->peers[mi].total_size=(uint64_t)sz; h->peers[mi].nb_queues=nq;

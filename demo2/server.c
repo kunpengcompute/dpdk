@@ -67,6 +67,7 @@ static int worker(void *a)
 		for (uint16_t i = 0; i < n; i++) {
 			win_bytes += pkts[i]->pkt_len;
 			rte_pktmbuf_free(pkts[i]);
+			// rte_mbuf_raw_free(pkts[i]);
 		}
 		window += n;
 
