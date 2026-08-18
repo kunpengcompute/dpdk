@@ -28,6 +28,30 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, INFO);
 #define UB_RING_POLL_US  50000
 #define UB_RING_POLL_S   60
 
+/* flow-trace helpers (debugging only): per-site counters with at most
+ * one log line per second, so the hot path never floods the console.
+ * Steady state should show roughly equal +N/s on every site. */
+#define UB_RING_FLOW_N(site, n) do { \
+	static uint64_t cnt, prev, last; \
+	uint64_t now = rte_rdtsc(); \
+	cnt += (n); \
+	if (now - last >= rte_get_tsc_hz()) { \
+		UB_RING_LOG(INFO, "[flow] %s: total=%" PRIu64 \
+			" (+%" PRIu64 "/s)", site, cnt, cnt - prev); \
+		prev = cnt; \
+		last = now; \
+	} \
+} while (0)
+
+#define UB_RING_FLOW_WARN(fmt, ...) do { \
+	static uint64_t last; \
+	uint64_t now = rte_rdtsc(); \
+	if (now - last >= rte_get_tsc_hz()) { \
+		last = now; \
+		UB_RING_LOG(WARNING, "[flow] " fmt, __VA_ARGS__); \
+	} \
+} while (0)
+
 static const char *ubs_strerror(int rc)
 {
 	switch (rc) {
@@ -379,8 +403,12 @@ rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h, uint32_t pi)
 {
 	if (!h || pi>=UB_RING_MAX_NODES||!h->data_rings||!h->data_rings[pi]) return NULL;
 	void *e;
-	if (rte_ring_mc_dequeue_bulk(h->data_rings[pi], &e, 1, NULL) == 0) return NULL;
+	if (rte_ring_mc_dequeue_bulk(h->data_rings[pi], &e, 1, NULL) == 0) {
+		UB_RING_FLOW_WARN("alloc_buf FAIL pi=%u (data ring empty)", pi);
+		return NULL;
+	}
 	sync_peer_data_ring(h, pi);
+	UB_RING_FLOW_N("alloc_buf", 1);
 	return ub_ring_buf_ptr(h->peers[pi].data_buf_area, (uintptr_t)e);
 }
 
@@ -402,13 +430,17 @@ rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs, uint16_t nb)
 {
 	if (!h || !bufs || !nb) return;
 	struct rte_ring *rr = own_return_ring(h);
-	if (!rr) return;
+	if (!rr) {
+		UB_RING_FLOW_WARN("return_burst: no own return ring (data ring not synced?)");
+		return;
+	}
 	void *e[nb];
 	for (uint16_t i = 0; i < nb; i++)
 		e[i] = buf_elem(bufs[i]);
 	/* one bulk SP enqueue per drain pass instead of one CAS
 	 * per buffer (workers would serialize on the return ring) */
 	rte_ring_sp_enqueue_bulk(rr, e, nb, NULL);
+	UB_RING_FLOW_N("return_burst", nb);
 }
 
 void
@@ -445,8 +477,10 @@ rte_ub_ring_collect(struct rte_ub_ring_handle *h)
 		struct rte_ring *rr = h->peers[i].return_ring;
 		if (!rr) continue;
 		void *elems[64];
+		uint64_t tot = 0;
 		uint16_t n;
 		while ((n = (uint16_t)rte_ring_dequeue_burst(rr, elems, 64, NULL)) > 0) {
+			tot += n;
 			/* elements carry {pi, offset}: the return ring
 			 * belongs to the provider that performed the return,
 			 * the buffer belongs to pi — enqueue the offset to
@@ -476,6 +510,8 @@ rte_ub_ring_collect(struct rte_ub_ring_handle *h)
 				k += run;
 			}
 		}
+		if (tot)
+			UB_RING_FLOW_N("collect", tot);
 	}
 }
 
@@ -503,6 +539,7 @@ uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, void *
 { if(!h||q>=h->total_queues||!b||!n)return 0; void *e[n];
   uint16_t r=(uint16_t)rte_ring_dequeue_burst(h->rx_rings[q],e,n,NULL);
   for(uint16_t i=0;i<r;i++){uint8_t ni=ub_ring_elem_get_node(e[i]);uint64_t o=ub_ring_elem_get_offset(e[i]);sync_peer_data_ring(h,ni);b[i]=ub_ring_buf_ptr(h->peers[ni].data_buf_area,o);}
+  if (r) UB_RING_FLOW_N("recv_burst", r);
   return r; }
 int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 	if (!h || h->mpmc_enabled) return -EINVAL;
@@ -553,7 +590,7 @@ uint16_t rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, voi
 void rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 	if (!h || !h->mpmc_enabled || q >= h->total_queues) return;
 	/* shadow holds encoded {pi, offset} elements — move directly */
-	void *elems[64]; uint16_t n;
+	void *elems[64]; uint16_t n; uint64_t moved = 0;
 	while ((n = (uint16_t)rte_ring_dequeue_burst(h->shadow_tx[q], (void**)elems, 64, NULL)) > 0) {
 		uint16_t s = (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q], elems, n, NULL);
 		if (s < n) {
@@ -562,7 +599,10 @@ void rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 				rte_ring_enqueue_burst(h->shadow_tx[q], &elems[i], 1, NULL);
 			break;
 		}
+		moved += s;
 	}
+	if (moved)
+		UB_RING_FLOW_N("flush_tx", moved);
 }
 
 void rte_ub_ring_flush_tx_all(struct rte_ub_ring_handle *h)

@@ -14,6 +14,7 @@
 #include <rte_mempool.h>
 #include <rte_ring.h>
 #include <rte_kvargs.h>
+#include <rte_cycles.h>
 #include <rte_ethdev.h>
 #include <bus_vdev_driver.h>
 #include <ethdev_driver.h>
@@ -25,6 +26,28 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 #define RTE_LOGTYPE_UB_RING_ETH ub_ring_eth_logtype
 #define UB_RING_ETH_LOG(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, UB_RING_ETH, "%s(): ", __func__, __VA_ARGS__)
+
+/* flow-trace helpers (debugging only): at most one line per second */
+#define UB_RING_ETH_FLOW_N(site, n) do { \
+	static uint64_t cnt, prev, last; \
+	uint64_t now = rte_rdtsc(); \
+	cnt += (n); \
+	if (now - last >= rte_get_tsc_hz()) { \
+		UB_RING_ETH_LOG(INFO, "[flow] %s: total=%" PRIu64 \
+			" (+%" PRIu64 "/s)", site, cnt, cnt - prev); \
+		prev = cnt; \
+		last = now; \
+	} \
+} while (0)
+
+#define UB_RING_ETH_FLOW_WARN(fmt, ...) do { \
+	static uint64_t last; \
+	uint64_t now = rte_rdtsc(); \
+	if (now - last >= rte_get_tsc_hz()) { \
+		last = now; \
+		UB_RING_ETH_LOG(WARNING, "[flow] " fmt, __VA_ARGS__); \
+	} \
+} while (0)
 
 #define UB_RING_ETH_MAX_BURST 128
 
@@ -158,6 +181,7 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 {
 	if (!d) return;
 	void *o[32];
+	uint64_t got = 0;
 	/* fixed-size all-or-nothing batches, no dependence on the pool
 	 * internals: freed mbufs sit in the workers' per-lcore caches
 	 * until they overflow into the ring; bypass the cache here
@@ -171,7 +195,10 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 		/* one bulk SP enqueue per drain pass instead of one CAS
 		 * per buffer (workers would serialize on the return ring) */
 		rte_ub_ring_return_burst(h, o, 32);
+		got += 32;
 	}
+	if (got)
+		UB_RING_ETH_FLOW_N("drn", got);
 }
 
 static struct rte_mempool *mkp(void)
@@ -228,7 +255,10 @@ static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 		if(!buf)break;
 		raw[c]=buf; raw_pi[c]=pi_used; c++;
 	}
-	if(!c)return 0;
+	if(!c){
+		UB_RING_ETH_FLOW_WARN("eth_tx: enc failed (no free buffer anywhere)");
+		return 0;
+	}
 	/*
 	 * Ownership model:
 	 *  - sent buffers: ownership transferred to peer; peer returns
@@ -241,6 +271,8 @@ static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 		: rte_ub_ring_send_burst_pi(h, rq->queue_id, raw_pi, raw, c);
 	for (uint16_t i = s; i < c; i++)
 		free_enc_chain(h, raw[i]);
+	if (s)
+		UB_RING_ETH_FLOW_N("eth_tx", s);
 	return s; }
 
 static int eth_cfg(struct rte_eth_dev*d __rte_unused){return 0;}
