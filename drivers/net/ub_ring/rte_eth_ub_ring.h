@@ -35,8 +35,10 @@ int rte_eth_ub_ring_attach(const char *name, struct rte_ub_ring_handle *h);
  * providers while the workers only receive.
  *
  * @param port_id  port returned by rte_eth_ub_ring_attach()
+ * @return number of buffers returned to the return rings
+ *         (0 = nothing to drain / idle)
  */
-void rte_eth_ub_ring_drain(int port_id);
+unsigned int rte_eth_ub_ring_drain(int port_id);
 
 #ifdef __cplusplus
 }

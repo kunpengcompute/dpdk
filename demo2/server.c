@@ -58,8 +58,26 @@ struct targ { int pid; uint32_t qid; };
 static int drain_worker(void *a)
 {
 	int pid = *(int *)a;
-	while (g_running)
-		rte_eth_ub_ring_drain(pid);
+	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
+	uint64_t loops = 0, work = 0;
+	while (g_running) {
+		loops++;
+		work += rte_eth_ub_ring_drain(pid) > 0;
+
+		uint64_t now = rte_rdtsc();
+		if (now - last >= hz) {
+			printf("[poll drain] loops=%llu work=%llu "
+				"idle=%llu busy=%.1f%%\n",
+				(unsigned long long)loops,
+				(unsigned long long)work,
+				(unsigned long long)(loops - work),
+				loops ? 100.0 * (double)work /
+					(double)loops : 0);
+			last = now;
+			loops = 0;
+			work = 0;
+		}
+	}
 	return 0;
 }
 
@@ -69,13 +87,17 @@ static int worker(void *a)
 	struct rte_mbuf *pkts[BS];
 	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
 	uint64_t window = 0, win_bytes = 0;
+	uint64_t loops = 0, work = 0;
 
 	/* receive forever, print the rate once per second
 	 * (bandwidth uses the actual pkt_len of each packet) */
 	while (g_running) {
 		uint16_t n = rte_eth_rx_burst(ta->pid, ta->qid, pkts, BS);
-		if (n == 0)
+		loops++;
+		if (n == 0) {
 			continue;
+		}
+		++work;
 		for (uint16_t i = 0; i < n; i++) {
 			win_bytes += pkts[i]->pkt_len;
 			rte_pktmbuf_free(pkts[i]);
@@ -87,11 +109,18 @@ static int worker(void *a)
 		if (now - last >= hz) {
 			double secs = (double)(now - last) / hz;
 			double mpps = window / secs / 1e6;
-			printf("[Srv q%u] %.2f Mpps, %.2f Mbps\n",
-				ta->qid, mpps, win_bytes / secs * 8 / 1e6);
+			printf("[Srv q%u] %.2f Mpps, %.2f Mbps | "
+				"loops=%llu work=%llu busy=%.1f%%\n",
+				ta->qid, mpps, win_bytes / secs * 8 / 1e6,
+				(unsigned long long)loops,
+				(unsigned long long)work,
+				loops ? 100.0 * (double)work /
+					(double)loops : 0);
 			last = now;
 			window = 0;
 			win_bytes = 0;
+			loops = 0;
+			work = 0;
 		}
 	}
 	return 0;

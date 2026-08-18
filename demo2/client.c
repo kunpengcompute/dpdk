@@ -60,9 +60,28 @@ static int flush_worker(void *arg)
 	(void)arg;
 	/* TX flush only: this demo never receives, so rx flush is skipped
 	 * on the hot path (a one-shot final flush_rx still runs at exit) */
+	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
+	uint64_t loops = 0, work = 0;
 	while (g_running) {
+		uint64_t moved = 0;
 		for (uint32_t q = 0; q < g_nb_q; q++)
-			rte_ub_ring_flush_tx(g_h, q);
+			moved += rte_ub_ring_flush_tx(g_h, q);
+		loops++;
+		work += moved > 0;
+
+		uint64_t now = rte_rdtsc();
+		if (now - last >= hz) {
+			printf("[poll flush] loops=%llu work=%llu "
+				"idle=%llu busy=%.1f%%\n",
+				(unsigned long long)loops,
+				(unsigned long long)work,
+				(unsigned long long)(loops - work),
+				loops ? 100.0 * (double)work /
+					(double)loops : 0);
+			last = now;
+			loops = 0;
+			work = 0;
+		}
 	}
 	return 0;
 }
@@ -73,8 +92,26 @@ static int flush_worker(void *arg)
 static int collect_worker(void *arg)
 {
 	(void)arg;
-	while (g_running)
-		rte_ub_ring_collect(g_h);
+	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
+	uint64_t loops = 0, work = 0;
+	while (g_running) {
+		loops++;
+		work += rte_ub_ring_collect(g_h) > 0;
+
+		uint64_t now = rte_rdtsc();
+		if (now - last >= hz) {
+			printf("[poll collect] loops=%llu work=%llu "
+				"idle=%llu busy=%.1f%%\n",
+				(unsigned long long)loops,
+				(unsigned long long)work,
+				(unsigned long long)(loops - work),
+				loops ? 100.0 * (double)work /
+					(double)loops : 0);
+			last = now;
+			loops = 0;
+			work = 0;
+		}
+	}
 	return 0;
 }
 
@@ -105,6 +142,7 @@ static int sender(void *a)
 	/* send round-robin over this sender's queues forever,
 	 * print the rate once per second */
 	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc(), window = 0;
+	uint64_t loops = 0, work = 0;
 	while (g_running) {
 		for (uint32_t i = 0; i < sa->nq_own && g_running; i++) {
 			uint32_t q = sa->q0 + i;
@@ -112,21 +150,28 @@ static int sender(void *a)
 			while (g_running && sent < nb_built) {
 				uint16_t s = rte_eth_tx_burst(sa->pid, q,
 					&burst[sent], nb_built - sent);
-				if (s == 0)
-					continue;
 				sent += s;
-			}
-			window += sent;
+				window += s;
+				loops++;
+				work += s > 0;
 
-			uint64_t now = rte_rdtsc();
-			if (now - last >= hz) {
-				double secs = (double)(now - last) / hz;
-				double mpps = window / secs / 1e6;
-				printf("[Cli lc%u] %.2f Mpps, %.2f Mbps\n",
-					rte_lcore_id(), mpps,
-					mpps * sa->pkt_len * 8);
-				last = now;
-				window = 0;
+				uint64_t now = rte_rdtsc();
+				if (now - last >= hz) {
+					double secs = (double)(now - last) / hz;
+					double mpps = window / secs / 1e6;
+					printf("[Cli lc%u] %.2f Mpps, %.2f Mbps | "
+						"loops=%llu work=%llu busy=%.1f%%\n",
+						rte_lcore_id(), mpps,
+						mpps * sa->pkt_len * 8,
+						(unsigned long long)loops,
+						(unsigned long long)work,
+						loops ? 100.0 * (double)work /
+							(double)loops : 0);
+					last = now;
+					window = 0;
+					loops = 0;
+					work = 0;
+				}
 			}
 		}
 	}

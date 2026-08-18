@@ -184,10 +184,11 @@ static struct rte_mbuf *dec(void *buf, struct rte_mempool *dp, struct rte_ub_rin
 	return m;
 }
 
-static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
+static uint32_t drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 {
-	if (!d) return;
+	if (!d) return 0;
 	void *o[32];
+	uint32_t got = 0;
 	/* fixed-size all-or-nothing batches, no dependence on the pool
 	 * internals: freed mbufs sit in the workers' per-lcore caches
 	 * until they overflow into the ring; bypass the cache here
@@ -202,8 +203,10 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 		/* one bulk SP enqueue per drain pass instead of one CAS
 		 * per buffer (workers would serialize on the return ring) */
 		rte_ub_ring_return_burst(h, o, 32);
+		got += 32;
 		UB_RING_ETH_FLOW_N("drn", 32);
 	}
+	return got;
 }
 
 static struct rte_mempool *mkp(void)
@@ -393,14 +396,14 @@ rte_eth_ub_ring_attach(const char *name, struct rte_ub_ring_handle *h)
 	return ret ? -1 : (int)pid;
 }
 
-void
+unsigned int
 rte_eth_ub_ring_drain(int port_id)
 {
 	if (port_id < 0 || port_id >= RTE_MAX_ETHPORTS)
-		return;
+		return 0;
 	struct rte_eth_dev *d = &rte_eth_devices[port_id];
 	if (!d->data || !d->data->dev_private)
-		return;
+		return 0;
 	struct ub_ring_eth_internals *in = d->data->dev_private;
-	drn(in->dummy_pool, in->ub_ring_h);
+	return drn(in->dummy_pool, in->ub_ring_h);
 }

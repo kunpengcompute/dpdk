@@ -235,8 +235,10 @@ void rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs,
  * so each buffer lands in the right local data ring. Return rings are
  * SPSC, so run this on a dedicated lcore (the only consumer); the demo
  * loops it on the collect lcore.
+ *
+ * @return number of buffers collected (0 = nothing to collect / idle)
  */
-void rte_ub_ring_collect(struct rte_ub_ring_handle *h);
+uint64_t rte_ub_ring_collect(struct rte_ub_ring_handle *h);
 
 /**
  * Get the data element size for a provider's data ring.
@@ -320,8 +322,10 @@ uint16_t rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h,
 /**
  * Flush TX: move all from shadow_tx[qid] → real tx_ring[qid].
  * Single-threaded caller only.
+ *
+ * @return number of elements actually moved (0 = shadow empty / idle)
  */
-void rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t qid);
+uint64_t rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t qid);
 
 /**
  * Flush TX for all queues, retrying until every shadow_tx ring is
