@@ -4,6 +4,11 @@ sources = files('rte_ub_ring.c')
 headers = files('rte_ub_ring.h')
 deps += 'ring'
 
+# data-path flow-trace logging: debug builds only
+if get_option('buildtype').startswith('debug')
+    cflags += '-DUB_RING_FLOW_TRACE'
+endif
+
 # External ubsmem dependency
 ubsmem_inc = include_directories('/usr/local/ubs_mem/include')
 includes += ubsmem_inc

@@ -27,7 +27,10 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 #define UB_RING_ETH_LOG(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, UB_RING_ETH, "%s(): ", __func__, __VA_ARGS__)
 
-/* flow-trace helpers (debugging only): at most one line per second */
+/* flow-trace helpers: at most one line per second.
+ * Only compiled in when -DUB_RING_FLOW_TRACE is set (debug builds —
+ * see drivers/net/ub_ring/meson.build); expands to nothing otherwise. */
+#ifdef UB_RING_FLOW_TRACE
 #define UB_RING_ETH_FLOW_N(site, n) do { \
 	static uint64_t cnt, prev, last; \
 	uint64_t now = rte_rdtsc(); \
@@ -48,6 +51,10 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 		UB_RING_ETH_LOG(WARNING, "[flow] " fmt, ##__VA_ARGS__); \
 	} \
 } while (0)
+#else
+#define UB_RING_ETH_FLOW_N(site, n) do { } while (0)
+#define UB_RING_ETH_FLOW_WARN(fmt, ...) do { } while (0)
+#endif
 
 #define UB_RING_ETH_MAX_BURST 128
 
@@ -181,7 +188,6 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 {
 	if (!d) return;
 	void *o[32];
-	uint64_t got = 0;
 	/* fixed-size all-or-nothing batches, no dependence on the pool
 	 * internals: freed mbufs sit in the workers' per-lcore caches
 	 * until they overflow into the ring; bypass the cache here
@@ -196,10 +202,8 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 		/* one bulk SP enqueue per drain pass instead of one CAS
 		 * per buffer (workers would serialize on the return ring) */
 		rte_ub_ring_return_burst(h, o, 32);
-		got += 32;
+		UB_RING_ETH_FLOW_N("drn", 32);
 	}
-	if (got)
-		UB_RING_ETH_FLOW_N("drn", got);
 }
 
 static struct rte_mempool *mkp(void)

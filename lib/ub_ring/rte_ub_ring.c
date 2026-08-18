@@ -28,9 +28,12 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, INFO);
 #define UB_RING_POLL_US  50000
 #define UB_RING_POLL_S   60
 
-/* flow-trace helpers (debugging only): per-site counters with at most
- * one log line per second, so the hot path never floods the console.
- * Steady state should show roughly equal +N/s on every site. */
+/* flow-trace helpers: per-site counters with at most one log line per
+ * second, so the hot path never floods the console. Steady state should
+ * show roughly equal +N/s on every site.
+ * Only compiled in when -DUB_RING_FLOW_TRACE is set (debug builds —
+ * see lib/ub_ring/meson.build); expands to nothing otherwise. */
+#ifdef UB_RING_FLOW_TRACE
 #define UB_RING_FLOW_N(site, n) do { \
 	static uint64_t cnt, prev, last; \
 	uint64_t now = rte_rdtsc(); \
@@ -51,6 +54,10 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, INFO);
 		UB_RING_LOG(WARNING, "[flow] " fmt, ##__VA_ARGS__); \
 	} \
 } while (0)
+#else
+#define UB_RING_FLOW_N(site, n) do { } while (0)
+#define UB_RING_FLOW_WARN(fmt, ...) do { } while (0)
+#endif
 
 static const char *ubs_strerror(int rc)
 {
