@@ -112,16 +112,22 @@ sync_peer_data_ring(struct rte_ub_ring_handle *h, uint32_t i)
 	h->peers[i].data_buf_end   = (char *)h->peers[i].data_buf_area + (size_t)m->data_nb_bufs * m->data_elt_size;
 }
 
-static int find_peer_by_buf(struct rte_ub_ring_handle *h, const void *buf)
+/* buffer -> packed {pi, offset} element: both come from the 128B
+ * ownership header written by user_init (O(1), no node scan) */
+static void *
+buf_elem(void *buf)
 {
-	for (uint32_t i = 0; i < UB_RING_MAX_NODES; i++) {
-		sync_peer_data_ring(h, i);
-		if (!h->peers[i].data_buf_area || !h->peers[i].data_buf_end) continue;
-		if ((const char *)buf >= (const char *)h->peers[i].data_buf_area &&
-		    (const char *)buf < (const char *)h->peers[i].data_buf_end) return (int)i;
-	}
-	UB_RING_LOG(ERR, "buf %p not in any data ring", buf);
-	return -1;
+	struct ub_ring_buf_hdr *hd = ub_ring_buf_hdr(buf);
+	return ub_ring_elem_pack((uint8_t)hd->node_index, hd->offset);
+}
+
+/* the return ring used for a return action: the CALLING provider's own
+ * ring, not the one of the buffer's owning provider */
+static struct rte_ring *
+own_return_ring(struct rte_ub_ring_handle *h)
+{
+	sync_peer_data_ring(h, h->my_node_index);
+	return h->peers[h->my_node_index].return_ring;
 }
 
 static size_t crs(uint32_t qd) { return rte_ring_get_memsize(qd); }
@@ -256,9 +262,10 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 	char my[MAX_HOST_NAME_DESC_LENGTH]; ubsmem_options_t o; ubsmem_region_attributes_t a;
 	uint32_t mi, tot; int rc;
 	if (!pn||!np||np>UB_RING_MAX_NODES||nu>UB_RING_MAX_NODES||!reg||!pre||!elt){rte_errno=EINVAL;return NULL;}
-	/* element size as a 128B multiple: every buffer starts on a
-	 * 128B boundary (given the 128B-aligned buffer area start) */
-	elt = RTE_ALIGN(elt, 128);
+	/* element = 128B ownership header + caller payload, as a 128B
+	 * multiple: every buffer starts on a 128B boundary (given the
+	 * 128B-aligned buffer area start) */
+	elt = RTE_ALIGN(elt + UB_RING_BUF_HDR_SIZE, 128);
 	struct rte_ub_ring_handle *h=rte_zmalloc(NULL,sizeof(*h),0); if(!h)return NULL;
 	h->role=UB_RING_ROLE_USER; snprintf(h->region_name,64,"%s",reg); snprintf(h->shm_prefix,64,"%s",pre);
 	char names[UB_RING_MAX_NODES][64];
@@ -328,9 +335,18 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		h->data_rings[pi]=rte_ring_create(dn,mx,rte_socket_id(),0);
 		if(!h->data_rings[pi]){UB_RING_LOG(ERR,"local data ring fail");goto fail_reg;}
 
-		/* populate: enqueue all free offsets to local data ring */
+		/* populate: write each buffer's ownership header (once, then
+		 * read-only), then enqueue all free offsets to the local
+		 * data ring */
 		for(uint32_t idx=0;idx<mx;idx+=64){void*e[64];uint32_t n=RTE_MIN(64u,mx-idx);
-			for(uint32_t k=0;k<n;k++)e[k]=(void*)(uintptr_t)((idx+k)*elt);
+			for(uint32_t k=0;k<n;k++){
+				struct ub_ring_buf_hdr *hd=(struct ub_ring_buf_hdr*)((char*)ba+(size_t)(idx+k)*elt);
+				hd->node_index=pi;
+				hd->offset=(uint32_t)((idx+k)*elt);
+				hd->elt_size=elt;
+				hd->magic=UB_RING_BUF_MAGIC;
+				e[k]=(void*)(uintptr_t)((idx+k)*elt);
+			}
 			rte_ring_enqueue_burst(h->data_rings[pi],e,n,NULL);}
 
 		pm->data_ring_offset=dr_off;
@@ -365,18 +381,19 @@ rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h, uint32_t pi)
 	void *e;
 	if (rte_ring_mc_dequeue_bulk(h->data_rings[pi], &e, 1, NULL) == 0) return NULL;
 	sync_peer_data_ring(h, pi);
-	return (char *)h->peers[pi].data_buf_area + (size_t)(uintptr_t)e;
+	return ub_ring_buf_ptr(h->peers[pi].data_buf_area, (uintptr_t)e);
 }
 
 void
 rte_ub_ring_return_buf(struct rte_ub_ring_handle *h, void *buf)
 {
 	if (!h || !buf) return;
-	int ni = find_peer_by_buf(h, buf);
-	if (ni < 0) return;
-	struct rte_ring *rr = h->peers[ni].return_ring;
+	/* the provider performing the return uses its OWN return ring;
+	 * the element carries {pi, offset} from the buffer's header, so
+	 * ownership is independent of which ring the buffer passes through */
+	struct rte_ring *rr = own_return_ring(h);
 	if (!rr) return;
-	void *e = (void *)(uintptr_t)((char *)buf - (char *)h->peers[ni].data_buf_area);
+	void *e = buf_elem(buf);
 	rte_ring_sp_enqueue_bulk(rr, &e, 1, NULL);
 }
 
@@ -384,23 +401,14 @@ void
 rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs, uint16_t nb)
 {
 	if (!h || !bufs || !nb) return;
-	int ni0 = find_peer_by_buf(h, bufs[0]);
-	if (ni0 < 0) return;
+	struct rte_ring *rr = own_return_ring(h);
+	if (!rr) return;
 	void *e[nb];
-	uint16_t c = 0;
-	for (uint16_t i = 0; i < nb; i++) {
-		int ni = find_peer_by_buf(h, bufs[i]);
-		if (ni < 0 || ni != ni0) {
-			/* buffers span several peers: fall back per buffer */
-			for (uint16_t k = 0; k < nb; k++)
-				rte_ub_ring_return_buf(h, bufs[k]);
-			return;
-		}
-		e[c++] = (void *)(uintptr_t)((char *)bufs[i] -
-			(char *)h->peers[ni0].data_buf_area);
-	}
-	if (!h->peers[ni0].return_ring) return;
-	rte_ring_sp_enqueue_bulk(h->peers[ni0].return_ring, e, c, NULL);
+	for (uint16_t i = 0; i < nb; i++)
+		e[i] = buf_elem(bufs[i]);
+	/* one bulk SP enqueue per drain pass instead of one CAS
+	 * per buffer (workers would serialize on the return ring) */
+	rte_ring_sp_enqueue_bulk(rr, e, nb, NULL);
 }
 
 void
@@ -408,17 +416,25 @@ rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
 {
 	if (!h || !buf) return;
 	/* single buffer only — chains are split by rte_pktmbuf_free on the
-	 * peer side, each segment entering the dummy pool separately */
-	int ni = find_peer_by_buf(h, buf);
-	if (ni < 0) { UB_RING_LOG(ERR, "free_buf %p: peer not found", buf); return; }
-	void *e = (void *)(uintptr_t)((char *)buf - (char *)h->peers[ni].data_buf_area);
-	/* user: return to local data ring (MP — concurrent with collect);
-	 * provider: return to shm return ring */
-	if (h->data_rings && h->data_rings[ni])
+	 * peer side, each segment entering the dummy pool separately.
+	 * Ownership comes from the 128B header (O(1), no node scan) */
+	struct ub_ring_buf_hdr *hd = ub_ring_buf_hdr(buf);
+	uint32_t ni = hd->node_index;
+	void *e = (void *)(uintptr_t)hd->offset;
+	/* user: return to the owning provider's local data ring (MP —
+	 * concurrent with collect); provider: return via its OWN return
+	 * ring as a packed {pi, offset} element */
+	if (h->data_rings && h->data_rings[ni]) {
 		rte_ring_mp_enqueue_bulk(h->data_rings[ni], &e, 1, NULL);
-	else if (h->peers[ni].return_ring)
-		rte_ring_sp_enqueue_bulk(h->peers[ni].return_ring, &e, 1, NULL);
-	else { UB_RING_LOG(ERR, "free_buf %p: no ring for ni=%d (leak!)", buf, ni); }
+		return;
+	}
+	struct rte_ring *rr = own_return_ring(h);
+	if (rr) {
+		void *pe = buf_elem(buf);
+		rte_ring_sp_enqueue_bulk(rr, &pe, 1, NULL);
+	} else {
+		UB_RING_LOG(ERR, "free_buf %p: no return ring (leak!)", buf);
+	}
 }
 
 void
@@ -427,11 +443,39 @@ rte_ub_ring_collect(struct rte_ub_ring_handle *h)
 	if (!h || !h->data_rings) return;
 	for (uint32_t i = 0; i < UB_RING_MAX_NODES; i++) {
 		struct rte_ring *rr = h->peers[i].return_ring;
-		if (!rr || !h->data_rings[i]) continue;
-		void *bufs[64];
+		if (!rr) continue;
+		void *elems[64];
 		uint16_t n;
-		while ((n = (uint16_t)rte_ring_dequeue_burst(rr, bufs, 64, NULL)) > 0)
-			rte_ring_enqueue_burst(h->data_rings[i], bufs, n, NULL);
+		while ((n = (uint16_t)rte_ring_dequeue_burst(rr, elems, 64, NULL)) > 0) {
+			/* elements carry {pi, offset}: the return ring
+			 * belongs to the provider that performed the return,
+			 * the buffer belongs to pi — enqueue the offset to
+			 * pi's local data ring */
+			uint16_t k = 0;
+			while (k < n) {
+				uint32_t pi = ub_ring_elem_get_node(elems[k]);
+				/* group consecutive same-owner elements into
+				 * one bulk MP enqueue */
+				uint16_t run = 1;
+				while (k + run < n &&
+				       ub_ring_elem_get_node(elems[k + run]) == pi)
+					run++;
+				if (!h->data_rings[pi]) {
+					UB_RING_LOG(ERR,
+						"collect: no data ring for pi=%u (leak!)",
+						pi);
+					k += run;
+					continue;
+				}
+				void *offs[64];
+				for (uint16_t j = 0; j < run; j++)
+					offs[j] = (void *)(uintptr_t)
+						ub_ring_elem_get_offset(elems[k + j]);
+				rte_ring_mp_enqueue_bulk(h->data_rings[pi],
+					offs, run, NULL);
+				k += run;
+			}
+		}
 	}
 }
 
@@ -444,21 +488,21 @@ void *rte_ub_ring_get_data_buf_area(struct rte_ub_ring_handle *h, uint32_t pi)
 uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
 { if(!h||q>=h->total_queues||!b||!n)return 0; void *e[n];uint16_t c=0;
   /* fail-fast: any invalid buffer → send nothing (caller frees all) */
-  for(uint16_t i=0;i<n;i++){if(!b[i])return 0;int ni=find_peer_by_buf(h,b[i]);if(ni<0)return 0;
-  uint64_t o=(uint64_t)((char*)b[i]-(char*)h->peers[ni].data_buf_area);e[c++]=ub_ring_elem_pack((uint8_t)ni,o);}
+  for(uint16_t i=0;i<n;i++){if(!b[i])return 0;e[c++]=buf_elem(b[i]);}
   return (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,c,NULL); }
 
 uint16_t rte_ub_ring_send_burst_pi(struct rte_ub_ring_handle *h, uint32_t q,
 		const uint32_t *pi, void **b, uint16_t n)
 { if(!h||q>=h->total_queues||!b||!pi||!n)return 0; void *e[n];uint16_t c=0;
+  /* caller-provided pi (from alloc_buf); offset from the header */
   for(uint16_t i=0;i<n;i++){if(!b[i])return 0;
-  uint64_t o=(uint64_t)((char*)b[i]-(char*)h->peers[pi[i]].data_buf_area);
-  e[c++]=ub_ring_elem_pack((uint8_t)pi[i],o);}
+  struct ub_ring_buf_hdr *hd=ub_ring_buf_hdr(b[i]);
+  e[c++]=ub_ring_elem_pack((uint8_t)pi[i],hd->offset);}
   return (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,c,NULL); }
 uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
 { if(!h||q>=h->total_queues||!b||!n)return 0; void *e[n];
   uint16_t r=(uint16_t)rte_ring_dequeue_burst(h->rx_rings[q],e,n,NULL);
-  for(uint16_t i=0;i<r;i++){uint8_t ni=ub_ring_elem_get_node(e[i]);uint64_t o=ub_ring_elem_get_offset(e[i]);sync_peer_data_ring(h,ni);b[i]=(char*)h->peers[ni].data_buf_area+o;}
+  for(uint16_t i=0;i<r;i++){uint8_t ni=ub_ring_elem_get_node(e[i]);uint64_t o=ub_ring_elem_get_offset(e[i]);sync_peer_data_ring(h,ni);b[i]=ub_ring_buf_ptr(h->peers[ni].data_buf_area,o);}
   return r; }
 int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 	if (!h || h->mpmc_enabled) return -EINVAL;
@@ -491,18 +535,9 @@ mp_send_pack(struct rte_ub_ring_handle *h, uint32_t q, const uint32_t *pi,
 	for (uint16_t i = 0; i < n; i++) {
 		if (!b[i])
 			return 0;
-		uint32_t ni;
-		if (use_pi)
-			ni = pi[i];
-		else {
-			int r = find_peer_by_buf(h, b[i]);
-			if (r < 0)
-				return 0;
-			ni = (uint32_t)r;
-		}
-		uint64_t o = (uint64_t)((char *)b[i] -
-			(char *)h->peers[ni].data_buf_area);
-		e[c++] = ub_ring_elem_pack((uint8_t)ni, o);
+		struct ub_ring_buf_hdr *hd = ub_ring_buf_hdr(b[i]);
+		uint32_t ni = use_pi ? pi[i] : hd->node_index;
+		e[c++] = ub_ring_elem_pack((uint8_t)ni, hd->offset);
 	}
 	return (uint16_t)rte_ring_enqueue_burst(h->shadow_tx[q], e, c, NULL);
 }

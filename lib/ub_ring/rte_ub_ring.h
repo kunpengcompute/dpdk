@@ -53,6 +53,43 @@ struct ub_ring_metadata {
 	uint64_t queue_offsets[];          /* [rx_offsets...][tx_offsets...] */
 } __rte_aligned(64);
 
+/* ---- per-buffer ownership header (128B prefix of every element) ---- */
+
+#define UB_RING_BUF_HDR_SIZE 128
+#define UB_RING_BUF_MAGIC   0x55425248ULL /* "UBRH" */
+
+/* written once by user_init, read-only afterwards */
+struct ub_ring_buf_hdr {
+	uint32_t node_index; /* owning provider node index */
+	uint32_t offset;     /* element offset from data_buf_area (bytes) */
+	uint32_t elt_size;   /* element stride in bytes (sanity check) */
+	uint32_t magic;      /* UB_RING_BUF_MAGIC */
+};
+
+/* The app-visible buffer pointer sits UB_RING_BUF_HDR_SIZE past the
+ * element base; the ownership header is right in front of it. */
+static inline struct ub_ring_buf_hdr *
+ub_ring_buf_hdr(const void *buf)
+{
+	return (struct ub_ring_buf_hdr *)((const char *)buf -
+			UB_RING_BUF_HDR_SIZE);
+}
+
+/* element base area + offset -> app-visible buffer pointer */
+static inline void *
+ub_ring_buf_ptr(void *area, uint64_t off)
+{
+	return (char *)area + off + UB_RING_BUF_HDR_SIZE;
+}
+
+/* app-visible buffer pointer -> element-base offset */
+static inline uint64_t
+ub_ring_buf_off(void *area, const void *buf)
+{
+	return (uint64_t)((const char *)buf - (const char *)area -
+			UB_RING_BUF_HDR_SIZE);
+}
+
 /* ---- ring element codec (8+56 bit packing) ---- */
 
 static inline void *
@@ -162,36 +199,42 @@ uint32_t rte_ub_ring_get_total_queues(struct rte_ub_ring_handle *h);
 
 /**
  * Allocate a buffer from a provider's local data ring (user only).
+ * Returns the app-visible pointer: element base + 128B ownership
+ * header (see ub_ring_buf_hdr()).
  */
 void *rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h,
 			    uint32_t provider_node_index);
 
 /**
  * Free a buffer back to local data ring (user) or return ring (provider).
+ * Ownership is read from the buffer's 128B header (O(1), no node scan).
  */
 void rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf);
 
 /**
- * Return a used buffer to the provider's return ring (provider side).
+ * Return a used buffer (provider side). The element enqueued to the
+ * return ring is packed {node_index, offset} read from the buffer's
+ * 128B header, and the ring used is the CALLING provider's own return
+ * ring — independent of which provider owns the buffer.
  * Return rings are SPSC: only the provider's drain lcore may call this
  * (any other caller must be serialized with it, e.g. at teardown).
  */
 void rte_ub_ring_return_buf(struct rte_ub_ring_handle *h, void *buf);
 
 /**
- * Return a batch of used buffers to the providers' return rings.
- * One bulk SP enqueue when all buffers belong to the same peer —
- * much cheaper than nb single-buffer enqueues. Return rings are SPSC:
- * single producer (the provider's drain lcore) / single consumer
- * (the user's collect lcore).
+ * Return a batch of used buffers (provider side). Same rules as
+ * rte_ub_ring_return_buf() — packed {node_index, offset} elements into
+ * the calling provider's own return ring, one bulk SP enqueue per batch.
  */
 void rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs,
 			      uint16_t nb);
 
 /**
  * Collect all buffers from return rings and enqueue to local data rings.
- * User side only. Return rings are SPSC, so run this on a dedicated
- * lcore (the only consumer); the demo loops it on the collect lcore.
+ * User side only. Return ring elements carry the owning provider index,
+ * so each buffer lands in the right local data ring. Return rings are
+ * SPSC, so run this on a dedicated lcore (the only consumer); the demo
+ * loops it on the collect lcore.
  */
 void rte_ub_ring_collect(struct rte_ub_ring_handle *h);
 

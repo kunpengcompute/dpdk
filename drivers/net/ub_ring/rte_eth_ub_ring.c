@@ -88,8 +88,10 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref,
 	uint16_t save_buf_len = m->buf_len;
 
 	if (nb) {
-		uint64_t off = (uint64_t)((char *)nb -
-			(char *)rte_ub_ring_get_data_buf_area(h, nb_pi));
+		/* pack the child pointer as {pi, element-base offset} so
+		 * dec() can rebuild it */
+		uint64_t off = ub_ring_buf_off(
+			rte_ub_ring_get_data_buf_area(h, nb_pi), nb);
 		m->next = (struct rte_mbuf *)(uintptr_t)(((uint64_t)nb_pi << 56) | off);
 	} else {
 		m->next = (struct rte_mbuf *)(uintptr_t)UINT64_MAX;
@@ -117,7 +119,8 @@ free_enc_chain(struct rte_ub_ring_handle *h, void *buf)
 		if (nv != UINT64_MAX) {
 			uint8_t ni = (uint8_t)(nv >> 56);
 			uint64_t off = nv & 0x00FFFFFFFFFFFFFFULL;
-			next = (char *)rte_ub_ring_get_data_buf_area(h, ni) + off;
+			next = ub_ring_buf_ptr(
+				rte_ub_ring_get_data_buf_area(h, ni), off);
 		}
 		rte_ub_ring_free_buf(h, buf);
 		buf = next;
@@ -139,7 +142,7 @@ static struct rte_mbuf *dec(void *buf, struct rte_mempool *dp, struct rte_ub_rin
 	m->buf_addr = (char *)m + sizeof(struct rte_mbuf) + m->priv_size; m->pool = dp;
 	if (nv != UINT64_MAX) {
 		uint8_t ni = (uint8_t)(nv >> 56); uint64_t off = nv & 0x00FFFFFFFFFFFFFFULL;
-		void *nb = (char *)rte_ub_ring_get_data_buf_area(h, ni) + off;
+		void *nb = ub_ring_buf_ptr(rte_ub_ring_get_data_buf_area(h, ni), off);
 		if (nb == buf) {
 			UB_RING_ETH_LOG(ERR, "self-referencing next: buf=%p ni=%u off=0x%" PRIx64,
 					buf, ni, off);
