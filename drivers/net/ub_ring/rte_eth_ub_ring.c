@@ -190,7 +190,8 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 	 * ring and is picked up once the next flush tops it up — the
 	 * drain lcore loops this anyway */
 	for (;;) {
-		if (rte_mempool_ops_dequeue_bulk(d, o, 32) != 32)
+		/* mempool ops contract: 0 = got n objects, <0 = empty */
+		if (rte_mempool_ops_dequeue_bulk(d, o, 32) < 0)
 			break;
 		/* one bulk SP enqueue per drain pass instead of one CAS
 		 * per buffer (workers would serialize on the return ring) */
@@ -213,14 +214,15 @@ static struct rte_mempool *mkp(void)
 		/* drain all placeholder objects so only freed mbufs are
 		 * ever retrieved. Dequeue straight from the ring (get_bulk
 		 * would refill this lcore's cache with placeholders):
-		 * fixed-size batches, then one-by-one for the tail */
+		 * fixed-size batches, then one-by-one for the tail.
+		 * mempool ops contract: 0 = got n objects, <0 = empty */
 		void *o[64];
 		for (;;) {
-			if (rte_mempool_ops_dequeue_bulk(mp, o, 64) != 64)
+			if (rte_mempool_ops_dequeue_bulk(mp, o, 64) < 0)
 				break;
 		}
 		for (;;) {
-			if (rte_mempool_ops_dequeue_bulk(mp, o, 1) != 1)
+			if (rte_mempool_ops_dequeue_bulk(mp, o, 1) < 0)
 				break;
 		}
 	}
