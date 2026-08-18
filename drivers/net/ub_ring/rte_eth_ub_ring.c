@@ -45,7 +45,7 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 	uint64_t now = rte_rdtsc(); \
 	if (now - last >= rte_get_tsc_hz()) { \
 		last = now; \
-		UB_RING_ETH_LOG(WARNING, "[flow] " fmt, __VA_ARGS__); \
+		UB_RING_ETH_LOG(WARNING, "[flow] " fmt, ##__VA_ARGS__); \
 	} \
 } while (0)
 
