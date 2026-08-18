@@ -155,23 +155,19 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 {
 	if (!d) return;
 	void *o[32];
+	/* fixed-size all-or-nothing batches, no dependence on the pool
+	 * internals: freed mbufs sit in the workers' per-lcore caches
+	 * until they overflow into the ring; bypass the cache here
+	 * (get_bulk would strand up to cache_size objects in this
+	 * lcore's cache). A partial tail below one batch stays in the
+	 * ring and is picked up once the next flush tops it up — the
+	 * drain lcore loops this anyway */
 	for (;;) {
-		/* ring count only: freed mbufs sit in the workers' per-lcore
-		 * caches until they overflow into the ring — the ring is all
-		 * this lcore can reach, so stop when it is empty */
-		unsigned int cnt = rte_mempool_ops_get_count(d);
-		if (cnt == 0)
+		if (rte_mempool_ops_dequeue_bulk(d, o, 32) != 32)
 			break;
-		unsigned int n = RTE_MIN(cnt, 32u);
-		/* bypass the cache: get_bulk would refill this lcore's
-		 * cache and strand up to cache_size objects here. The ring
-		 * backend is all-or-nothing and cnt >= n, so this succeeds
-		 * (SC dequeue: this lcore is the pool's only getter) */
-		if (rte_mempool_ops_dequeue_bulk(d, o, n) != (int)n)
-			break;
-		/* one bulk MP enqueue per drain pass instead of one CAS
+		/* one bulk SP enqueue per drain pass instead of one CAS
 		 * per buffer (workers would serialize on the return ring) */
-		rte_ub_ring_return_burst(h, o, n);
+		rte_ub_ring_return_burst(h, o, 32);
 	}
 }
 
@@ -185,15 +181,16 @@ static struct rte_mempool *mkp(void)
 	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",64*1024,0,256,0,NULL,NULL,NULL,NULL,rte_socket_id(),MEMPOOL_F_SC_GET);
 	if (mp) {
 		/* drain all placeholder objects so only freed mbufs are
-		 * ever retrieved. Dequeue straight from the ring: get_bulk
-		 * would refill this lcore's cache with placeholders */
+		 * ever retrieved. Dequeue straight from the ring (get_bulk
+		 * would refill this lcore's cache with placeholders):
+		 * fixed-size batches, then one-by-one for the tail */
 		void *o[64];
 		for (;;) {
-			unsigned int cnt = rte_mempool_ops_get_count(mp);
-			if (cnt == 0)
+			if (rte_mempool_ops_dequeue_bulk(mp, o, 64) != 64)
 				break;
-			unsigned int n = RTE_MIN(cnt, 64u);
-			if (rte_mempool_ops_dequeue_bulk(mp, o, n) != (int)n)
+		}
+		for (;;) {
+			if (rte_mempool_ops_dequeue_bulk(mp, o, 1) != 1)
 				break;
 		}
 	}

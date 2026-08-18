@@ -161,7 +161,7 @@ C -> LDR : ⑦ MP 入队 → 回到 ①
 ## 5. 注意事项
 
 1. **dummy pool 容量**：64K 远小于在途上限 mx≈1M。正常运行 drain 跟得上没问题；若 drain 线程长期停摆，pool 溢出后 `pktmbuf_free` 静默失败，这些 buffer 永久泄漏在 server 端，client 的 data ring 会逐渐耗尽。
-2. **收尾残留**：退出瞬间每个 worker 核的 cache 最多压着 ~384 个 mbuf 到不了 ring，这批 buffer 不归还（只影响收尾统计，不影响运行期）。
+2. **收尾残留**：退出瞬间每个 worker 核的 cache 最多压着 ~384 个 mbuf 到不了 ring，这批 buffer 不归还；dummy ring 里不足一批（32）的尾数同理留在 ring 里。只影响收尾统计，不影响运行期。
 3. **return 环 SPSC 契约**：入队必须全部来自 drain lcore；`free_buf` 的 provider 分支同样 SP 入队，若 server 侧 TX 失败回退与 drain 并发会破坏契约——demo 中 server 从不 TX。
 4. **shadow_rx SPMC**：flush 线程是唯一生产端；demo 无收包流量，flush 线程热路径已去掉 rx flush，仅退出时执行一次 flush_rx。
 5. **dummy pool 的 cache 只缓冲 free 方向**：drain 线程出队绕开自己核的 cache 直取 ring——否则 get_bulk 回填会把最多 256 个对象残留在 drain 核的 cache 里永远不归还。
