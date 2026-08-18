@@ -173,21 +173,25 @@ void rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf);
 
 /**
  * Return a used buffer to the provider's return ring (provider side).
- * Provider workers call this after processing a buffer.
+ * Return rings are SPSC: only the provider's drain lcore may call this
+ * (any other caller must be serialized with it, e.g. at teardown).
  */
 void rte_ub_ring_return_buf(struct rte_ub_ring_handle *h, void *buf);
 
 /**
  * Return a batch of used buffers to the providers' return rings.
- * One bulk MP enqueue when all buffers belong to the same peer —
- * much cheaper than nb single-buffer enqueues under contention.
+ * One bulk SP enqueue when all buffers belong to the same peer —
+ * much cheaper than nb single-buffer enqueues. Return rings are SPSC:
+ * single producer (the provider's drain lcore) / single consumer
+ * (the user's collect lcore).
  */
 void rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs,
 			      uint16_t nb);
 
 /**
  * Collect all buffers from return rings and enqueue to local data rings.
- * User side only. Should be called from the flush path.
+ * User side only. Return rings are SPSC, so run this on a dedicated
+ * lcore (the only consumer); the demo loops it on the collect lcore.
  */
 void rte_ub_ring_collect(struct rte_ub_ring_handle *h);
 
@@ -244,7 +248,9 @@ uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h,
 
 /**
  * Enable MPMC shadow rings for this handle.
- * Creates local shadow_tx/shadow_rx per queue.
+ * Creates local shadow rings per queue:
+ *  - shadow_tx: MP/SC — n sender lcores enqueue, flush lcore dequeues
+ *  - shadow_rx: SP/MC — flush lcore enqueues, rx lcores dequeue
  */
 int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h);
 bool rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h);

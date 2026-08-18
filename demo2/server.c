@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Server — N workers (one per queue), continuous RX with per-second
- * rate output on every worker.
- * Run: ./server --no-huge -l 1-5 --nq=4 [--time=10]
- *      nq   = number of queues/workers
+ * Server — N workers (one per queue) + 1 drain lcore, continuous RX
+ * with per-second rate output on every worker.
+ * Run: ./server --no-huge -l 1-6 --nq=4 [--time=10]
+ *      nq   = number of queues/workers (needs nq+1 lcores: workers+drain)
  *      time = run duration in seconds (0 = run until Ctrl+C)
  */
 #include <stdio.h>
@@ -50,6 +50,18 @@ static uint32_t app_opt_uint(int *argc, char **argv, const char *opt,
 }
 
 struct targ { int pid; uint32_t qid; };
+
+/* drain the dummy pool back to the providers' return rings on its own
+ * lcore: workers free into per-lcore caches and only the overflow
+ * reaches the ring, so this loop is what keeps buffers flowing back
+ * to the client */
+static int drain_worker(void *a)
+{
+	int pid = *(int *)a;
+	while (g_running)
+		rte_eth_ub_ring_drain(pid);
+	return 0;
+}
 
 static int worker(void *a)
 {
@@ -101,13 +113,14 @@ int main(int argc, char **argv)
 	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;
 	for (unsigned int l = 0; l < RTE_MAX_LCORE; l++)
 		if (rte_lcore_is_enabled(l) && l != ml) lc[nl++] = l;
-	if (g_nq > nl) {
-		fprintf(stderr, "need %u worker lcores (have %u)\n", g_nq, nl);
+	if (g_nq + 1 > nl) {
+		fprintf(stderr, "need %u worker lcores (have %u)\n",
+			g_nq + 1, nl);
 		return 1;
 	}
 
-	printf("\n===== Server (%u queues, %u workers, %s) =====\n\n",
-		g_nq, nl, duration ? "timed" : "Ctrl+C to stop");
+	printf("\n===== Server (%u queues, %u workers + 1 drain, %s) =====\n\n",
+		g_nq, g_nq, duration ? "timed" : "Ctrl+C to stop");
 
 	const char *pn[] = {"master"}, *un[] = {"worker1"};
 	struct rte_ub_ring_handle *h = rte_ub_ring_provider_init(
@@ -118,9 +131,11 @@ int main(int argc, char **argv)
 	rte_eth_dev_start(pid);
 
 	struct targ ta[UB_RING_MAX_QUEUES];
+	int dpid = pid;
+	rte_eal_remote_launch(drain_worker, &dpid, lc[0]);
 	for (uint32_t q = 0; q < g_nq; q++) {
 		ta[q] = (struct targ){ pid, q };
-		rte_eal_remote_launch(worker, &ta[q], lc[q]);
+		rte_eal_remote_launch(worker, &ta[q], lc[1 + q]);
 	}
 
 	/* run until the timer expires or Ctrl+C sets g_running = 0 */
@@ -131,7 +146,8 @@ int main(int argc, char **argv)
 		g_running = 0;
 	}
 	for (uint32_t q = 0; q < g_nq; q++)
-		rte_eal_wait_lcore(lc[q]);
+		rte_eal_wait_lcore(lc[1 + q]);
+	rte_eal_wait_lcore(lc[0]);
 
 	rte_eth_dev_stop(pid); rte_eth_dev_close(pid); rte_ub_ring_fini(h);
 	rte_eal_cleanup();

@@ -14,6 +14,7 @@
 #include <rte_log.h>
 #include <rte_malloc.h>
 #include <rte_errno.h>
+#include <rte_cycles.h>
 #include <rte_ring.h>
 
 #include <rte_ub_ring.h>
@@ -62,7 +63,9 @@ struct rte_ub_ring_handle {
 
 	struct {
 		void            *shm_base;
-		struct rte_ring *return_ring;   /* in shm: providers return bufs */
+		struct rte_ring *return_ring;   /* in shm, SP/SC: provider drain
+						   * lcore enqueues, user collect
+						   * lcore dequeues */
 		void            *data_buf_area, *data_buf_end;
 		uint32_t         data_elt_size;
 		/* metadata cached locally at init 鈥?no shm reads afterwards */
@@ -306,8 +309,9 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		void*drb=(char*)psh+dr_off;
 		struct rte_ring*rr=(struct rte_ring*)drb;
 		char rn[64];snprintf(rn,64,"ret_%s",pn2);
-		/* return ring: MP (providers enqueue), SC (user drain) */
-		rc=rte_ring_init(rr,rn,mx,RING_F_SC_DEQ);
+		/* return ring: SPSC — the provider's drain lcore enqueues,
+		 * the user's collect lcore dequeues */
+		rc=rte_ring_init(rr,rn,mx,RING_F_SP_ENQ|RING_F_SC_DEQ);
 		if(rc<0){UB_RING_LOG(ERR,"return ring init fail:%d",rc);goto fail_reg;}
 		void*ba=(void*)RTE_ALIGN((uintptr_t)((char*)drb+rrs),128);
 		h->peers[pi].return_ring=rr;
@@ -373,7 +377,7 @@ rte_ub_ring_return_buf(struct rte_ub_ring_handle *h, void *buf)
 	struct rte_ring *rr = h->peers[ni].return_ring;
 	if (!rr) return;
 	void *e = (void *)(uintptr_t)((char *)buf - (char *)h->peers[ni].data_buf_area);
-	rte_ring_mp_enqueue_bulk(rr, &e, 1, NULL);
+	rte_ring_sp_enqueue_bulk(rr, &e, 1, NULL);
 }
 
 void
@@ -396,7 +400,7 @@ rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs, uint16_t nb)
 			(char *)h->peers[ni0].data_buf_area);
 	}
 	if (!h->peers[ni0].return_ring) return;
-	rte_ring_mp_enqueue_bulk(h->peers[ni0].return_ring, e, c, NULL);
+	rte_ring_sp_enqueue_bulk(h->peers[ni0].return_ring, e, c, NULL);
 }
 
 void
@@ -413,7 +417,7 @@ rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
 	if (h->data_rings && h->data_rings[ni])
 		rte_ring_mp_enqueue_bulk(h->data_rings[ni], &e, 1, NULL);
 	else if (h->peers[ni].return_ring)
-		rte_ring_mp_enqueue_bulk(h->peers[ni].return_ring, &e, 1, NULL);
+		rte_ring_sp_enqueue_bulk(h->peers[ni].return_ring, &e, 1, NULL);
 	else { UB_RING_LOG(ERR, "free_buf %p: no ring for ni=%d (leak!)", buf, ni); }
 }
 
@@ -462,9 +466,11 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 	h->shadow_rx = rte_zmalloc(NULL, h->total_queues * sizeof(void*), 0);
 	if (!h->shadow_tx || !h->shadow_rx) return -ENOMEM;
 	for (uint32_t q = 0; q < h->total_queues; q++) {
-		/* 1M-deep shadow rings: senders may run far ahead of flush */
+		/* 1M-deep shadow rings: senders may run far ahead of flush.
+		 * stx: MP/SC (n senders enqueue, flush lcore dequeues)
+		 * srx: SP/MC (flush lcore enqueues, rx lcores dequeue) */
 		char n[64]; snprintf(n,64,"stx%u",q); h->shadow_tx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SC_DEQ);
-		snprintf(n,64,"srx%u",q); h->shadow_rx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SC_DEQ);
+		snprintf(n,64,"srx%u",q); h->shadow_rx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SP_ENQ);
 		if (!h->shadow_tx[q] || !h->shadow_rx[q]) return -ENOMEM;
 	}
 	h->mpmc_enabled = true; return 0;

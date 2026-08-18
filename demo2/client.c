@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Client — N send lcores + 1 flush lcore, continuous TX with
- * per-second rate output on every lcore.
+ * Client — N send lcores + 1 flush lcore + 1 collect lcore, continuous
+ * TX with per-second rate output on every lcore.
  * Run: ./client --no-huge -l 1-5 --ns=2 --pktlen=500 [--time=10]
  *      ns     = number of sender lcores (any value vs server queues:
  *               ns <= nq → contiguous queue blocks, RR within block;
  *               ns >  nq → sender s shares queue s % nq)
+ *               (needs ns+2 lcores: flush + collect + senders)
  *      pktlen = packet payload size (<= RTE_MBUF_DEFAULT_BUF_SIZE - headroom)
  *      time   = run duration in seconds (0 = run until Ctrl+C)
  */
@@ -57,13 +58,23 @@ static uint32_t app_opt_uint(int *argc, char **argv, const char *opt,
 static int flush_worker(void *arg)
 {
 	(void)arg;
+	/* TX flush only: this demo never receives, so rx flush is skipped
+	 * on the hot path (a one-shot final flush_rx still runs at exit) */
 	while (g_running) {
-		for (uint32_t q = 0; q < g_nb_q; q++) {
+		for (uint32_t q = 0; q < g_nb_q; q++)
 			rte_ub_ring_flush_tx(g_h, q);
-			rte_ub_ring_flush_rx(g_h, q);
-		}
-		rte_ub_ring_collect(g_h);
 	}
+	return 0;
+}
+
+/* move buffers the server returned back to the local data rings on its
+ * own lcore, so the senders' alloc_buf refills don't wait for a slow
+ * flush loop that also moves tx/rx traffic */
+static int collect_worker(void *arg)
+{
+	(void)arg;
+	while (g_running)
+		rte_ub_ring_collect(g_h);
 	return 0;
 }
 
@@ -145,9 +156,10 @@ int main(int argc, char **argv)
 	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;
 	for (unsigned int l = 0; l < RTE_MAX_LCORE; l++)
 		if (rte_lcore_is_enabled(l) && l != ml) lc[nl++] = l;
-	if (nl < ns + 1) {
-		fprintf(stderr, "need %u worker lcores (flush + %u senders)\n",
-			ns + 1, ns);
+	if (nl < ns + 2) {
+		fprintf(stderr,
+			"need %u worker lcores (flush + collect + %u senders)\n",
+			ns + 2, ns);
 		return 1;
 	}
 
@@ -168,6 +180,7 @@ int main(int argc, char **argv)
 
 	g_h = h; g_nb_q = tq;
 	rte_eal_remote_launch(flush_worker, NULL, lc[0]);
+	rte_eal_remote_launch(collect_worker, NULL, lc[1]);
 
 	/* each sender holds BS mbufs for the whole run (TX ownership
 	 * transferred, local mbufs never returned) → pool = ns * BS.
@@ -190,7 +203,7 @@ int main(int argc, char **argv)
 			sa[s].nq_own = base + (s < rem);
 			sa[s].pkt_len = pkt_len;
 			sa[s].mp = mp;
-			rte_eal_remote_launch(sender, &sa[s], lc[1 + s]);
+			rte_eal_remote_launch(sender, &sa[s], lc[2 + s]);
 		}
 	} else {
 		/* more senders than queues: sender s shares queue s % tq */
@@ -200,7 +213,7 @@ int main(int argc, char **argv)
 			sa[s].nq_own = 1;
 			sa[s].pkt_len = pkt_len;
 			sa[s].mp = mp;
-			rte_eal_remote_launch(sender, &sa[s], lc[1 + s]);
+			rte_eal_remote_launch(sender, &sa[s], lc[2 + s]);
 		}
 	}
 
@@ -212,13 +225,14 @@ int main(int argc, char **argv)
 		g_running = 0;
 	}
 	for (uint32_t s = 0; s < ns; s++)
-		rte_eal_wait_lcore(lc[1 + s]);
+		rte_eal_wait_lcore(lc[2 + s]);
 
-	/* stop the flush worker FIRST: shadow rings are SC_DEQ and shm
-	 * rings are SP_ENQ — a concurrent final flush from main would
+	/* stop the flush/collect workers FIRST: shadow rings are SC_DEQ and
+	 * shm rings are SP_ENQ — a concurrent final flush from main would
 	 * corrupt the rings and lose packets */
 	g_running = 0;
 	rte_eal_wait_lcore(lc[0]);
+	rte_eal_wait_lcore(lc[1]);
 
 	/* final flush alone (bounded: gives up if the peer stopped) */
 	rte_ub_ring_flush_tx_all(g_h);

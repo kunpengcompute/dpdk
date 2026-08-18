@@ -13,6 +13,7 @@
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_ring.h>
+#include <rte_kvargs.h>
 #include <rte_ethdev.h>
 #include <bus_vdev_driver.h>
 #include <ethdev_driver.h>
@@ -155,13 +156,19 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 	if (!d) return;
 	void *o[32];
 	for (;;) {
-		unsigned int cnt = rte_mempool_avail_count(d);
+		/* ring count only: freed mbufs sit in the workers' per-lcore
+		 * caches until they overflow into the ring — the ring is all
+		 * this lcore can reach, so stop when it is empty */
+		unsigned int cnt = rte_mempool_ops_get_count(d);
 		if (cnt == 0)
 			break;
 		unsigned int n = RTE_MIN(cnt, 32u);
-		/* rte_mempool_get_bulk returns 0 on success, <0 on error */
-		if (rte_mempool_get_bulk(d, o, n) < 0)
-			continue; /* raced with a concurrent consumer */
+		/* bypass the cache: get_bulk would refill this lcore's
+		 * cache and strand up to cache_size objects here. The ring
+		 * backend is all-or-nothing and cnt >= n, so this succeeds
+		 * (SC dequeue: this lcore is the pool's only getter) */
+		if (rte_mempool_ops_dequeue_bulk(d, o, n) != (int)n)
+			break;
 		/* one bulk MP enqueue per drain pass instead of one CAS
 		 * per buffer (workers would serialize on the return ring) */
 		rte_ub_ring_return_burst(h, o, n);
@@ -169,30 +176,34 @@ static void drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 }
 
 static struct rte_mempool *mkp(void)
-{ /* MP/MC: multiple worker threads put (pktmbuf_free) and get (drain).
-   * cache_size=0: this pool is only a "free → drain" staging area;
-   * a per-lcore cache would strand up to 64 mbufs per worker (avail_count
-   * only sees the ring), stalling the buffer return path.
+{ /* MPSC: put side is MP (each worker's cache overflow flushes into the
+   * ring), get side is SC (only the dedicated drain lcore — so the
+   * ring backend dequeue is lock-free). cache_size=256 batches the
+   * workers' frees so the hot pktmbuf_free path never takes the ring's
+   * MP enqueue lock.
    * 64K objects: more than every in-flight buffer can be freed at once */
-	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",64*1024,0,0,0,NULL,NULL,NULL,NULL,rte_socket_id(),0);
+	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",64*1024,0,256,0,NULL,NULL,NULL,NULL,rte_socket_id(),MEMPOOL_F_SC_GET);
 	if (mp) {
 		/* drain all placeholder objects so only freed mbufs are
-		 * ever retrieved. get_bulk returns 0 on success, <0 on error */
+		 * ever retrieved. Dequeue straight from the ring: get_bulk
+		 * would refill this lcore's cache with placeholders */
 		void *o[64];
 		for (;;) {
-			unsigned int cnt = rte_mempool_avail_count(mp);
+			unsigned int cnt = rte_mempool_ops_get_count(mp);
 			if (cnt == 0)
 				break;
 			unsigned int n = RTE_MIN(cnt, 64u);
-			if (rte_mempool_get_bulk(mp, o, n) < 0)
-				continue;
+			if (rte_mempool_ops_dequeue_bulk(mp, o, n) != (int)n)
+				break;
 		}
 	}
 	return mp; }
 
 static uint16_t eth_rx(void *q, struct rte_mbuf **b, uint16_t nb) {
 	struct ub_ring_eth_queue *rq=q; struct ub_ring_eth_internals *in=rq->internals;
-	struct rte_ub_ring_handle *h=in->ub_ring_h; drn(in->dummy_pool,h);
+	struct rte_ub_ring_handle *h=in->ub_ring_h;
+	/* freed mbufs are drained back to the providers by the app's own
+	 * lcore calling rte_eth_ub_ring_drain() — not on the RX path */
 	void *raw[UB_RING_ETH_MAX_BURST];
 	uint16_t n=rte_ub_ring_is_mpmc_enabled(h)?rte_ub_ring_mc_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST)):rte_ub_ring_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST));
 	/* prefetch the next buffer while decoding the current one: the
@@ -342,4 +353,16 @@ rte_eth_ub_ring_attach(const char *name, struct rte_ub_ring_handle *h)
 	uint16_t pid;
 	ret = rte_eth_dev_get_port_by_name(vname, &pid);
 	return ret ? -1 : (int)pid;
+}
+
+void
+rte_eth_ub_ring_drain(int port_id)
+{
+	if (port_id < 0 || port_id >= RTE_MAX_ETHPORTS)
+		return;
+	struct rte_eth_dev *d = &rte_eth_devices[port_id];
+	if (!d->data || !d->data->dev_private)
+		return;
+	struct ub_ring_eth_internals *in = d->data->dev_private;
+	drn(in->dummy_pool, in->ub_ring_h);
 }

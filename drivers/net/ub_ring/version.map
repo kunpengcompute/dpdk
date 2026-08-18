@@ -2,6 +2,7 @@ DPDK_25 {
 	global:
 
 	rte_eth_ub_ring_attach;
+	rte_eth_ub_ring_drain;
 
 	local: *;
 };
