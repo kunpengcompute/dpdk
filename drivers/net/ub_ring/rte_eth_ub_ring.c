@@ -56,6 +56,15 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 #define UB_RING_ETH_FLOW_WARN(fmt, ...) do { } while (0)
 #endif
 
+/* ---- temporary perf debug switch -------------------------------
+ * UB_RING_ETH_NO_COPY: skip the enc() memcpy (mbuf + payload into
+ * shm). The whole alloc → send → recv → return loop still runs, but
+ * the server decodes zeroed mbufs (pkt_len = 0). Define it to measure
+ * the copy cost on the client TX path; remove the define for normal
+ * runs.
+ */
+#define UB_RING_ETH_NO_COPY
+
 #define UB_RING_ETH_MAX_BURST 128
 
 struct ub_ring_eth_internals;
@@ -119,17 +128,29 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref,
 
 	if (nb) {
 		/* pack the child pointer as {pi, element-base offset} so
-		 * dec() can rebuild it */
+		 * dec() can rebuild it. off > 0 always: element 0 is
+		 * reserved, so a packed 0 would be ambiguous with the
+		 * NULL terminator */
 		uint64_t off = ub_ring_buf_off(
 			rte_ub_ring_get_data_buf_area(h, nb_pi), nb);
 		m->next = (struct rte_mbuf *)(uintptr_t)(((uint64_t)nb_pi << 56) | off);
 	} else {
-		m->next = (struct rte_mbuf *)(uintptr_t)UINT64_MAX;
+		/* 0 = no next segment (element 0 reserved, so no clash) */
+		m->next = NULL;
 	}
 	m->pool = NULL;
 	m->buf_len = m->data_off + m->data_len; /* no tailroom in shm */
 
+#ifdef UB_RING_ETH_NO_COPY
+	/* DEBUG: copy removed to measure its cost — the shm buffer stays
+	 * zeroed, so the server sees pkt_len = 0 (0 Mbps). refcnt = 1 is
+	 * written so rte_pktmbuf_prefree_seg() takes its return-m path
+	 * (a zero refcnt decrements to 65535 and the mbuf is never put
+	 * back); next stays 0, which now IS the NULL terminator */
+	((struct rte_mbuf *)buf)->refcnt = 1;
+#else
 	memcpy(buf, m, need);
+#endif
 
 	m->next = save_next;
 	m->pool = save_pool;
@@ -138,7 +159,7 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref,
 	return buf;
 }
 
-/* free an ENCODED buffer chain (next = packed {ni, off} or UINT64_MAX) */
+/* free an ENCODED buffer chain (next = packed {ni, off} or 0) */
 static void
 free_enc_chain(struct rte_ub_ring_handle *h, void *buf)
 {
@@ -146,7 +167,7 @@ free_enc_chain(struct rte_ub_ring_handle *h, void *buf)
 		struct rte_mbuf *m = buf;
 		uint64_t nv = (uint64_t)(uintptr_t)m->next;
 		void *next = NULL;
-		if (nv != UINT64_MAX) {
+		if (nv) {
 			uint8_t ni = (uint8_t)(nv >> 56);
 			uint64_t off = nv & 0x00FFFFFFFFFFFFFFULL;
 			next = ub_ring_buf_ptr(
@@ -170,7 +191,7 @@ static struct rte_mbuf *dec(void *buf, struct rte_mempool *dp, struct rte_ub_rin
 	}
 
 	m->buf_addr = (char *)m + sizeof(struct rte_mbuf) + m->priv_size; m->pool = dp;
-	if (nv != UINT64_MAX) {
+	if (nv) { /* 0 = no next segment (element 0 reserved, no clash) */
 		uint8_t ni = (uint8_t)(nv >> 56); uint64_t off = nv & 0x00FFFFFFFFFFFFFFULL;
 		void *nb = ub_ring_buf_ptr(rte_ub_ring_get_data_buf_area(h, ni), off);
 		if (nb == buf) {
