@@ -88,6 +88,17 @@ static const char *ubs_strerror(int rc)
 	}
 }
 
+/* per-lcore alloc cache: senders are pinned 1:1 to lcores, so each
+ * lcore's cache is touched by exactly one thread — no locks needed.
+ * The shared MP/MC data ring is accessed only for bulk refills via
+ * MC dequeue (CAS), the single cross-thread synchronization point —
+ * same pattern as a mempool per-lcore cache */
+#define UB_RING_ALLOC_CACHE_SIZE 512
+struct alloc_cache {
+	uint32_t len;
+	void *offs[UB_RING_ALLOC_CACHE_SIZE];
+};
+
 struct rte_ub_ring_handle {
 	uint32_t nb_nodes, my_node_index;
 	enum ub_ring_role role;
@@ -107,6 +118,9 @@ struct rte_ub_ring_handle {
 
 	/* local data rings (user only, one per provider shm) */
 	struct rte_ring **data_rings;
+
+	/* per-lcore alloc caches (user only, one per provider) */
+	struct alloc_cache *alloc_caches[UB_RING_MAX_NODES];
 
 	struct rte_ring **rx_rings, **tx_rings, **shadow_tx, **shadow_rx;
 	bool mpmc_enabled;
@@ -390,6 +404,12 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		char dn[64];snprintf(dn,64,"data_%s",pn2);
 		h->data_rings[pi]=rte_ring_create(dn,mx,rte_socket_id(),0);
 		if(!h->data_rings[pi]){UB_RING_LOG(ERR,"local data ring fail");goto fail_reg;}
+		/* pre-allocate the cache array; the entries stay empty and
+		 * are bulk-filled only on the first allocation that finds
+		 * them empty (see alloc_buf) */
+		h->alloc_caches[pi]=rte_zmalloc(NULL,
+			RTE_MAX_LCORE*sizeof(struct alloc_cache),0);
+		if(!h->alloc_caches[pi]){UB_RING_LOG(ERR,"alloc cache fail");goto fail_reg;}
 
 		/* populate: write each buffer's ownership header (once, then
 		 * read-only), then enqueue all free offsets to the local
@@ -436,11 +456,21 @@ void *
 rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h, uint32_t pi)
 {
 	if (!h || pi>=UB_RING_MAX_NODES||!h->data_rings||!h->data_rings[pi]) return NULL;
-	void *e;
-	if (rte_ring_mc_dequeue_bulk(h->data_rings[pi], &e, 1, NULL) == 0) {
-		UB_RING_FLOW_WARN("alloc_buf FAIL pi=%u (data ring empty)", pi);
-		return NULL;
+	struct alloc_cache *c = &h->alloc_caches[pi][rte_lcore_id()];
+	if (c->len == 0) {
+		/* lazy fill: bulk-refill only when this lcore's cache runs
+		 * dry — one MC dequeue per 512 allocations instead of one
+		 * CAS per buffer. Variable burst — an all-or-nothing bulk
+		 * would fail on a partial ring */
+		uint32_t n = rte_ring_mc_dequeue_burst(h->data_rings[pi],
+			c->offs, UB_RING_ALLOC_CACHE_SIZE, NULL);
+		if (n == 0) {
+			UB_RING_FLOW_WARN("alloc_buf FAIL pi=%u (data ring empty)", pi);
+			return NULL;
+		}
+		c->len = n;
 	}
+	void *e = c->offs[--c->len];
 	UB_RING_FLOW_N("alloc_buf", 1);
 	return ub_ring_buf_ptr(h->peers[pi].data_buf_area, (uintptr_t)e);
 }
@@ -688,6 +718,7 @@ void rte_ub_ring_fini(struct rte_ub_ring_handle *h) {
 	for (uint32_t i=0;i<UB_RING_MAX_NODES;i++){if(i==h->my_node_index)continue;if(h->peers[i].shm_base)ubsmem_shmem_unmap(h->peers[i].shm_base,h->peers[i].total_size);}
 	if(h->role==UB_RING_ROLE_PROVIDER&&h->peers[h->my_node_index].shm_base){ubsmem_shmem_unmap(h->peers[h->my_node_index].shm_base,h->peers[h->my_node_index].total_size);char nm[128],my[MAX_HOST_NAME_DESC_LENGTH];if(!gethostname(my,sizeof(my))){snprintf(nm,128,"%s_%s",h->shm_prefix,my);ubsmem_shmem_deallocate(nm);}}
 	if(h->data_rings){for(uint32_t i=0;i<UB_RING_MAX_NODES;i++)if(h->data_rings[i])rte_ring_free(h->data_rings[i]);rte_free(h->data_rings);}
+	for(uint32_t i=0;i<UB_RING_MAX_NODES;i++)rte_free(h->alloc_caches[i]);
 	if(h->shadow_tx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_tx[q]);rte_free(h->shadow_tx);}
 	if(h->shadow_rx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_rx[q]);rte_free(h->shadow_rx);}
 	ubsmem_destroy_region(h->region_name);ubsmem_finalize();rte_free(h->rx_rings);rte_free(h->tx_rings);rte_free(h);
