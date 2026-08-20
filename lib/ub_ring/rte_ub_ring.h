@@ -230,13 +230,30 @@ void rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs,
 			      uint16_t nb);
 
 /**
- * Collect all buffers from return rings and enqueue to local data rings.
- * User side only. Return ring elements carry the owning provider index,
- * so each buffer lands in the right local data ring. Return rings are
- * SPSC, so run this on a dedicated lcore (the only consumer); the demo
- * loops it on the collect lcore.
+ * Collect stage 1 (fetch): move buffers from the REMOTE return rings
+ * into the local mid ring. Run on its own lcore — this is where all
+ * the non-cacheable remote reads happen; everything else here is a
+ * local SP enqueue. One 512-batch per return ring per call (bounded).
  *
- * @return number of buffers collected (0 = nothing to collect / idle)
+ * @return number of buffers fetched (0 = idle)
+ */
+uint64_t rte_ub_ring_collect_fetch(struct rte_ub_ring_handle *h);
+
+/**
+ * Collect stage 2 (dispatch): SC-dequeue one batch from the local mid
+ * ring and route the packed {pi, offset} elements into pi's local
+ * data ring (AS-IS — all rings share one element format). Pure local
+ * work; run on its own lcore.
+ *
+ * @return number of buffers dispatched (0 = idle)
+ */
+uint64_t rte_ub_ring_collect_dispatch(struct rte_ub_ring_handle *h);
+
+/**
+ * Serial combined fetch+dispatch (e.g. for teardown). Requires
+ * rte_ub_ring_enable_mpmc() — the mid ring lives with the shadow rings.
+ *
+ * @return total number of buffers collected
  */
 uint64_t rte_ub_ring_collect(struct rte_ub_ring_handle *h);
 

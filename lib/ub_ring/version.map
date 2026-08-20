@@ -6,6 +6,8 @@ DPDK_25 {
 	rte_ub_ring_return_buf;
 	rte_ub_ring_return_burst;
 	rte_ub_ring_collect;
+	rte_ub_ring_collect_dispatch;
+	rte_ub_ring_collect_fetch;
 	rte_ub_ring_fini;
 	rte_ub_ring_get_data_buf_area;
 	rte_ub_ring_get_data_elt_size;

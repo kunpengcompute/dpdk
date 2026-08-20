@@ -123,6 +123,10 @@ struct rte_ub_ring_handle {
 	struct alloc_cache *alloc_caches[UB_RING_MAX_NODES];
 
 	struct rte_ring **rx_rings, **tx_rings, **shadow_tx, **shadow_rx;
+	/* collect pipeline mid ring (user only, SPSC): the fetch thread
+	 * SP-enqueues from the remote return rings, the dispatch thread
+	 * SC-dequeues and routes into the local data rings */
+	struct rte_ring *collect_mid;
 	bool mpmc_enabled;
 	uint32_t total_queues;
 	uint32_t queue_to_provider[UB_RING_MAX_QUEUES];
@@ -538,49 +542,71 @@ rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
 }
 
 uint64_t
-rte_ub_ring_collect(struct rte_ub_ring_handle *h)
+rte_ub_ring_collect_fetch(struct rte_ub_ring_handle *h)
 {
-	if (!h || !h->data_rings) return 0;
+	if (!h || !h->collect_mid) return 0;
 	uint64_t total = 0;
-	/* one batch per return ring, one pass over the ACTUAL nodes —
-	 * bounded work per call, so the caller's poll loop keeps ticking
-	 * (draining everything would starve its per-second accounting at
-	 * high return rates) */
+	/* stage 1: one 512-batch per remote return ring, one pass over
+	 * the actual nodes — bounded work per call so the caller's poll
+	 * loop keeps ticking. The remote (non-cacheable) reads stay in
+	 * this thread; everything else is a local SP enqueue */
 	for (uint32_t i = 0; i < h->nb_nodes; i++) {
 		struct rte_ring *rr = h->peers[i].return_ring;
 		if (!rr) continue;
-		void *elems[64];
-		uint16_t n = (uint16_t)rte_ring_dequeue_burst(rr, elems, 64, NULL);
+		void *elems[512];
+		uint16_t n = (uint16_t)rte_ring_dequeue_burst(rr, elems, 512, NULL);
 		if (n == 0)
 			continue;
-		/* elements carry {pi, offset}: the return ring belongs to
-		 * the provider that performed the return, the buffer
-		 * belongs to pi — move the packed elements AS-IS into
-		 * pi's local data ring (same format, no conversion) */
-		uint16_t k = 0;
-		while (k < n) {
-			uint32_t pi = ub_ring_elem_get_node(elems[k]);
-			/* group consecutive same-owner elements into one
-			 * bulk MP enqueue */
-			uint16_t run = 1;
-			while (k + run < n &&
-			       ub_ring_elem_get_node(elems[k + run]) == pi)
-				run++;
-			if (!h->data_rings[pi]) {
-				UB_RING_LOG(ERR,
-					"collect: no data ring for pi=%u (leak!)",
-					pi);
-				k += run;
-				continue;
-			}
-			rte_ring_mp_enqueue_bulk(h->data_rings[pi],
-				&elems[k], run, NULL);
-			k += run;
-		}
+		rte_ring_sp_enqueue_bulk(h->collect_mid, elems, n, NULL);
 		total += n;
-		UB_RING_FLOW_N("collect", n);
+		UB_RING_FLOW_N("collect_fetch", n);
 	}
 	return total;
+}
+
+uint64_t
+rte_ub_ring_collect_dispatch(struct rte_ub_ring_handle *h)
+{
+	if (!h || !h->collect_mid || !h->data_rings) return 0;
+	/* stage 2: pure local work — SC-dequeue one batch from the mid
+	 * ring and route the packed {pi, offset} elements into pi's
+	 * local data ring, AS-IS (all rings share one element format) */
+	void *elems[512];
+	uint16_t n = (uint16_t)rte_ring_dequeue_burst(
+		h->collect_mid, elems, 512, NULL);
+	if (n == 0)
+		return 0;
+	uint16_t k = 0;
+	while (k < n) {
+		uint32_t pi = ub_ring_elem_get_node(elems[k]);
+		/* group consecutive same-owner elements into one bulk
+		 * MP enqueue */
+		uint16_t run = 1;
+		while (k + run < n &&
+		       ub_ring_elem_get_node(elems[k + run]) == pi)
+			run++;
+		if (!h->data_rings[pi]) {
+			UB_RING_LOG(ERR,
+				"collect_dispatch: no data ring for pi=%u (leak!)",
+				pi);
+			k += run;
+			continue;
+		}
+		rte_ring_mp_enqueue_bulk(h->data_rings[pi],
+			&elems[k], run, NULL);
+		k += run;
+	}
+	UB_RING_FLOW_N("collect_dispatch", n);
+	return n;
+}
+
+uint64_t
+rte_ub_ring_collect(struct rte_ub_ring_handle *h)
+{
+	/* serial combined version (e.g. teardown): requires
+	 * rte_ub_ring_enable_mpmc() for the mid ring */
+	uint64_t n = rte_ub_ring_collect_fetch(h);
+	return n + rte_ub_ring_collect_dispatch(h);
 }
 
 uint32_t rte_ub_ring_get_data_elt_size(struct rte_ub_ring_handle *h, uint32_t pi)
@@ -622,6 +648,11 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 		snprintf(n,64,"srx%u",q); h->shadow_rx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SP_ENQ);
 		if (!h->shadow_tx[q] || !h->shadow_rx[q]) return -ENOMEM;
 	}
+	/* collect pipeline mid ring: SPSC, 1M deep — may hold the whole
+	 * in-flight set between the fetch and dispatch stages */
+	h->collect_mid = rte_ring_create("cmid", 1024*1024,
+		rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+	if (!h->collect_mid) return -ENOMEM;
 	h->mpmc_enabled = true; return 0;
 }
 bool rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h) { return h&&h->mpmc_enabled; }
@@ -723,5 +754,6 @@ void rte_ub_ring_fini(struct rte_ub_ring_handle *h) {
 	for(uint32_t i=0;i<UB_RING_MAX_NODES;i++)rte_free(h->alloc_caches[i]);
 	if(h->shadow_tx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_tx[q]);rte_free(h->shadow_tx);}
 	if(h->shadow_rx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_rx[q]);rte_free(h->shadow_rx);}
+	if(h->collect_mid)rte_ring_free(h->collect_mid);
 	ubsmem_destroy_region(h->region_name);ubsmem_finalize();rte_free(h->rx_rings);rte_free(h->tx_rings);rte_free(h);
 }

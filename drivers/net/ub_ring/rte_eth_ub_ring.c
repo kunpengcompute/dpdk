@@ -70,6 +70,9 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 struct ub_ring_eth_internals;
 struct ub_ring_eth_queue {
 	uint32_t queue_id, provider_index;
+	/* cached at setup: the element size is user-defined and
+	 * identical across providers — no per-packet lookup */
+	uint32_t elt_size;
 	struct ub_ring_eth_internals *internals;
 };
 struct ub_ring_eth_internals {
@@ -80,7 +83,7 @@ struct ub_ring_eth_internals {
 	struct rte_ether_addr address;
 };
 
-static void *enc(struct rte_mbuf *m, uint32_t pi_pref,
+static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
 		 struct rte_ub_ring_handle *h, uint32_t *pi_out)
 {
 	/* copy only header + priv + headroom + data (no tailroom) */
@@ -92,16 +95,23 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref,
 	 * back to any other node's data ring. The actual provider index
 	 * is returned in *pi_out so the caller can pack ring elements
 	 * correctly.
+	 *
+	 * elt_size is cached at queue setup — the element size is
+	 * user-defined and identical across all providers, so the hot
+	 * path never looks it up.
 	 */
 	uint32_t pi = pi_pref;
 	void *buf = NULL;
-	if (rte_ub_ring_get_data_elt_size(h, pi) >= need)
+	if (elt_size >= need)
 		buf = rte_ub_ring_alloc_buf(h, pi);
 	if (!buf) {
 		for (uint32_t c = 0; c < UB_RING_MAX_NODES; c++) {
+			uint32_t esz;
 			if (c == pi_pref)
 				continue;
-			if (rte_ub_ring_get_data_elt_size(h, c) < need)
+			/* cold path: skip nodes without a data ring */
+			esz = rte_ub_ring_get_data_elt_size(h, c);
+			if (esz == 0 || esz < need)
 				continue;
 			buf = rte_ub_ring_alloc_buf(h, c);
 			if (buf) { pi = c; break; }
@@ -208,7 +218,7 @@ static struct rte_mbuf *dec(void *buf, struct rte_mempool *dp, struct rte_ub_rin
 static uint32_t drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 {
 	if (!d) return 0;
-	void *o[32];
+	void *o[512];
 	uint32_t got = 0;
 	/* fixed-size all-or-nothing batches, no dependence on the pool
 	 * internals: freed mbufs sit in the workers' per-lcore caches
@@ -219,13 +229,13 @@ static uint32_t drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 	 * drain lcore loops this anyway */
 	for (;;) {
 		/* mempool ops contract: 0 = got n objects, <0 = empty */
-		if (rte_mempool_ops_dequeue_bulk(d, o, 32) < 0)
+		if (rte_mempool_ops_dequeue_bulk(d, o, 512) < 0)
 			break;
 		/* one bulk SP enqueue per drain pass instead of one CAS
 		 * per buffer (workers would serialize on the return ring) */
-		rte_ub_ring_return_burst(h, o, 32);
-		got += 32;
-		UB_RING_ETH_FLOW_N("drn", 32);
+		rte_ub_ring_return_burst(h, o, 512);
+		got += 512;
+		UB_RING_ETH_FLOW_N("drn", 512);
 	}
 	return got;
 }
@@ -281,7 +291,7 @@ static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 	void *raw[nb]; uint32_t raw_pi[nb]; uint16_t c=0;
 	for(uint16_t i=0;i<nb;i++){
 		uint32_t pi_used;
-		void*buf=enc(m[i],rq->provider_index,h,&pi_used);
+		void*buf=enc(m[i],rq->provider_index,rq->elt_size,h,&pi_used);
 		if(!buf)break;
 		raw[c]=buf; raw_pi[c]=pi_used; c++;
 	}
@@ -311,7 +321,7 @@ static int eth_stop(struct rte_eth_dev*d){d->data->dev_started=0;d->data->dev_li
 static int eth_close(struct rte_eth_dev*d){struct ub_ring_eth_internals*in=d->data->dev_private;eth_stop(d);if(in->dummy_pool){drn(in->dummy_pool,in->ub_ring_h);rte_mempool_free(in->dummy_pool);}d->data->mac_addrs=NULL;rte_free(in);d->data->dev_private=NULL;return 0;}
 static int eth_info(struct rte_eth_dev*d,struct rte_eth_dev_info*i){struct ub_ring_eth_internals*in=d->data->dev_private;uint32_t t=rte_ub_ring_get_total_queues(in->ub_ring_h);i->max_mac_addrs=1;i->max_rx_pktlen=(uint32_t)-1;i->max_rx_queues=(uint16_t)t;i->max_tx_queues=(uint16_t)t;i->min_rx_bufsize=0;i->rx_offload_capa=RTE_ETH_RX_OFFLOAD_SCATTER;i->tx_offload_capa=RTE_ETH_TX_OFFLOAD_MULTI_SEGS;return 0;}
 static int eth_rxq(struct rte_eth_dev*d,uint16_t q,uint16_t nb __rte_unused,unsigned int s __rte_unused,const struct rte_eth_rxconf*c __rte_unused,struct rte_mempool*p __rte_unused){struct ub_ring_eth_internals*in=d->data->dev_private;uint32_t t=rte_ub_ring_get_total_queues(in->ub_ring_h);if(q>=t)return -EINVAL;in->rx_queues[q].queue_id=q;in->rx_queues[q].provider_index=rte_ub_ring_queue_to_provider(in->ub_ring_h,q);in->rx_queues[q].internals=in;d->data->rx_queues[q]=&in->rx_queues[q];return 0;}
-static int eth_txq(struct rte_eth_dev*d,uint16_t q,uint16_t nb __rte_unused,unsigned int s __rte_unused,const struct rte_eth_txconf*c __rte_unused){struct ub_ring_eth_internals*in=d->data->dev_private;uint32_t t=rte_ub_ring_get_total_queues(in->ub_ring_h);if(q>=t)return -EINVAL;in->tx_queues[q].queue_id=q;in->tx_queues[q].provider_index=rte_ub_ring_queue_to_provider(in->ub_ring_h,q);in->tx_queues[q].internals=in;d->data->tx_queues[q]=&in->tx_queues[q];return 0;}
+static int eth_txq(struct rte_eth_dev*d,uint16_t q,uint16_t nb __rte_unused,unsigned int s __rte_unused,const struct rte_eth_txconf*c __rte_unused){struct ub_ring_eth_internals*in=d->data->dev_private;uint32_t t=rte_ub_ring_get_total_queues(in->ub_ring_h);if(q>=t)return -EINVAL;in->tx_queues[q].queue_id=q;in->tx_queues[q].provider_index=rte_ub_ring_queue_to_provider(in->ub_ring_h,q);in->tx_queues[q].elt_size=rte_ub_ring_get_data_elt_size(in->ub_ring_h,in->tx_queues[q].provider_index);in->tx_queues[q].internals=in;d->data->tx_queues[q]=&in->tx_queues[q];return 0;}
 static int eth_link(struct rte_eth_dev*d __rte_unused,int w __rte_unused){return 0;}
 static int eth_stats(struct rte_eth_dev*d,struct rte_eth_stats*s){(void)d;memset(s,0,sizeof(*s));return 0;}
 static int eth_sreset(struct rte_eth_dev*d){(void)d;return 0;}
@@ -355,9 +365,11 @@ vdev_probe(struct rte_vdev_device *vdev)
 	for (uint32_t i = 0; i < nq; i++) {
 		in->rx_queues[i].queue_id = i;
 		in->rx_queues[i].provider_index = rte_ub_ring_queue_to_provider(h, i);
+		in->rx_queues[i].elt_size = rte_ub_ring_get_data_elt_size(h, in->rx_queues[i].provider_index);
 		in->rx_queues[i].internals = in;
 		in->tx_queues[i].queue_id = i;
 		in->tx_queues[i].provider_index = rte_ub_ring_queue_to_provider(h, i);
+		in->tx_queues[i].elt_size = rte_ub_ring_get_data_elt_size(h, in->tx_queues[i].provider_index);
 		in->tx_queues[i].internals = in;
 	}
 	struct rte_eth_dev *ed = rte_eth_dev_allocate(dn);

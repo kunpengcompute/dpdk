@@ -29,6 +29,7 @@ shm 布局：`metadata → 2×nq 个 1M 深收发环 → return 环 → 数据�
 | 本地 data ring `data_{shm}` | user_init | **mx** 深，每 provider 1 个，元素=打包的 {pi,offset}（与其他环格式统一） | 0（**MP/MC**） | collect 线程 + sender 失败回退 free_buf（多个，MP） | n 个 sender 的 alloc_buf（多个，MC，经 per-lcore cache 批量取） |
 | shadow_tx `stx{q}` | enable_mpmc | 1M 深，每队列 | SC_DEQ（**MP/SC**） | n 个 sender（MP） | flush 线程（SC） |
 | shadow_rx `srx{q}` | enable_mpmc | 1M 深，每队列 | SP_ENQ（**SP/MC**） | flush 线程（SP） | rx 线程（MC，**demo 未用**） |
+| collect mid 环 `cmid` | enable_mpmc | 1M 深 | SP_ENQ \| SC_DEQ（**SPSC**） | collect_fetch 线程（SP） | collect_dispatch 线程（SC） |
 | tx mempool `tx` | client main | 32×n 个 mbuf，**cache=0** | MP/MC ring backend | —（不回收） | n 个 sender 启动时各取 32 个，持有全程 |
 
 ### 1.3 server 本地
@@ -46,8 +47,9 @@ shm 布局：`metadata → 2×nq 个 1M 深收发环 → return 环 → 数据�
 | lcore | 线程 | 与 ring / mempool 的交互 |
 |---|---|---|
 | lc[0] | flush_worker | 循环 tq 个队列：shadow_tx[q] SC 出队 → shm tx_ring[q] SP 入队。**demo 无收包，热路径不做 rx flush**（仅退出时一次性 flush_rx） |
-| lc[1] | collect_worker | 循环：各 provider 的 return 环 SC 出队 → 按元素内 pi 解码 → 对应本地 data ring MP 入队 |
-| lc[2+s] | sender s | 启动：tx pool 取 32 个 mbuf；循环：data ring MC 出队（alloc_buf）→ enc 拷贝进 shm → shadow_tx[q] MP 入队；enc 失败：free_buf MP 入回 data ring |
+| lc[1] | collect_fetch_worker | 循环：各 provider 的 **远程** return 环 SC 出队（每环一批 512）→ 本地 mid 环 SP 入队——远程 non-cacheable 读集中在此线程 |
+| lc[2] | collect_dispatch_worker | 循环：mid 环 SC 出队（一批 512）→ 按元素内 pi 路由 → 对应本地 data ring MP 入队——纯本地工作 |
+| lc[3+s] | sender s | 启动：tx pool 取 32 个 mbuf；循环：data ring MC 出队（alloc_buf，经 per-lcore cache）→ enc 拷贝进 shm → shadow_tx[q] MP 入队；enc 失败：free_buf MP 入回 data ring |
 
 队列分配：ns ≤ tq 时连续均分（前 rem 个 sender 多拿一个队列，块内 RR）；ns > tq 时 sender s 共享队列 s % tq。
 
@@ -115,7 +117,9 @@ participant "worker w" as W
 participant "dummy pool\nMP put / SC get" as D
 participant "drain lcore" as DR
 participant "return ring\nSP/SC" as RR
-participant "collect lcore" as C
+participant "collect_fetch lcore" as C
+participant "mid ring\nSP/SC" as MID
+participant "collect_dispatch lcore" as DI
 
 S -> LDR : ① alloc_buf（MC 出队偏移量）
 LDR --> S : buffer 地址 = 数据区 + 偏移
@@ -129,8 +133,10 @@ W -> D : ⑤ pktmbuf_free → 本核 cache\n（溢出 256 个冲入 ring）
 DR -> D : ⑥ 直取 ring（绕 cache，SC）
 DR -> DR : 回退 128B 读归属头 {pi,off}
 DR -> RR : return_burst（打包元素 SP 批量入本节点环）
-C -> RR : ⑦ collect（SC 出队）
-C -> LDR : ⑦ 按元素内 pi 解码 → 对应 data ring MP 入队 → 回到 ①
+C -> RR : ⑦ collect_fetch（SC 出队，远程读）
+C -> MID : ⑦ SP 入 mid 环
+DI -> MID : ⑦ collect_dispatch（SC 出队，本地）
+DI -> LDR : ⑦ 按元素内 pi 路由 → 对应 data ring MP 入队 → 回到 ①
 @enduml
 ```
 
@@ -156,6 +162,7 @@ C -> LDR : ⑦ 按元素内 pi 解码 → 对应 data ring MP 入队 → 回到 
 | 本地 data ring | MP/MC | collect 线程 + sender 失败回退（多个） | n senders（多个） | 必须 CAS，两侧都多线程 |
 | shadow_tx[q] | MP/SC | n senders（多个） | flush 线程（唯一） | 入队 CAS，出队免锁 |
 | shadow_rx[q] | **SP/MC** | flush 线程（唯一） | rx 线程（多个，demo 无） | 入队免锁，出队 CAS |
+| collect mid 环 | **SP/SC** | collect_fetch（唯一） | collect_dispatch（唯一） | 两端均单线程 |
 | dummy mempool ring | **MP put / SC get** | m workers 的 cache 溢出（多个） | drain 线程（唯一） | 入队 CAS，出队免锁 |
 | tx mempool ring | MP/MC | —（demo 不回收） | n senders 启动分配（多个） | CAS |
 

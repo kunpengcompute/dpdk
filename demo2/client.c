@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Client — N send lcores + 1 flush lcore + 1 collect lcore, continuous
- * TX with per-second rate output on every lcore.
- * Run: ./client --no-huge -l 1-5 --ns=2 --pktlen=500 [--time=10]
+ * Client — N send lcores + 1 flush lcore + collect 2-stage pipeline
+ * (fetch + dispatch), continuous TX with per-second rate output on
+ * every lcore.
+ * Run: ./client --no-huge -l 1-6 --ns=2 --pktlen=500 [--time=10]
  *      ns     = number of sender lcores (any value vs server queues:
  *               ns <= nq → contiguous queue blocks, RR within block;
  *               ns >  nq → sender s shares queue s % nq)
- *               (needs ns+2 lcores: flush + collect + senders)
+ *               (needs ns+3 lcores: flush + fetch + dispatch + senders)
  *      pktlen = packet payload size (<= RTE_MBUF_DEFAULT_BUF_SIZE - headroom)
  *      time   = run duration in seconds (0 = run until Ctrl+C)
  */
@@ -86,21 +87,49 @@ static int flush_worker(void *arg)
 	return 0;
 }
 
-/* move buffers the server returned back to the local data rings on its
- * own lcore, so the senders' alloc_buf refills don't wait for a slow
- * flush loop that also moves tx/rx traffic */
-static int collect_worker(void *arg)
+/* collect stage 1: move buffers from the REMOTE return rings into the
+ * local mid ring — all the non-cacheable remote reads stay here,
+ * everything else is a local SP enqueue */
+static int collect_fetch_worker(void *arg)
 {
 	(void)arg;
 	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
 	uint64_t loops = 0, work = 0;
 	while (g_running) {
 		loops++;
-		work += rte_ub_ring_collect(g_h) > 0;
+		work += rte_ub_ring_collect_fetch(g_h) > 0;
 
 		uint64_t now = rte_rdtsc();
 		if (now - last >= hz) {
-			printf("[poll collect] loops=%llu work=%llu "
+			printf("[poll collect_fetch] loops=%llu work=%llu "
+				"idle=%llu busy=%.1f%%\n",
+				(unsigned long long)loops,
+				(unsigned long long)work,
+				(unsigned long long)(loops - work),
+				loops ? 100.0 * (double)work /
+					(double)loops : 0);
+			last = now;
+			loops = 0;
+			work = 0;
+		}
+	}
+	return 0;
+}
+
+/* collect stage 2: route the mid ring's elements into the per-provider
+ * local data rings — pure local work */
+static int collect_dispatch_worker(void *arg)
+{
+	(void)arg;
+	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
+	uint64_t loops = 0, work = 0;
+	while (g_running) {
+		loops++;
+		work += rte_ub_ring_collect_dispatch(g_h) > 0;
+
+		uint64_t now = rte_rdtsc();
+		if (now - last >= hz) {
+			printf("[poll collect_dispatch] loops=%llu work=%llu "
 				"idle=%llu busy=%.1f%%\n",
 				(unsigned long long)loops,
 				(unsigned long long)work,
@@ -201,10 +230,11 @@ int main(int argc, char **argv)
 	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;
 	for (unsigned int l = 0; l < RTE_MAX_LCORE; l++)
 		if (rte_lcore_is_enabled(l) && l != ml) lc[nl++] = l;
-	if (nl < ns + 2) {
+	if (nl < ns + 3) {
 		fprintf(stderr,
-			"need %u worker lcores (flush + collect + %u senders)\n",
-			ns + 2, ns);
+			"need %u worker lcores (flush + collect_fetch + "
+			"collect_dispatch + %u senders)\n",
+			ns + 3, ns);
 		return 1;
 	}
 
@@ -225,7 +255,8 @@ int main(int argc, char **argv)
 
 	g_h = h; g_nb_q = tq;
 	rte_eal_remote_launch(flush_worker, NULL, lc[0]);
-	rte_eal_remote_launch(collect_worker, NULL, lc[1]);
+	rte_eal_remote_launch(collect_fetch_worker, NULL, lc[1]);
+	rte_eal_remote_launch(collect_dispatch_worker, NULL, lc[2]);
 
 	/* each sender holds BS mbufs for the whole run (TX ownership
 	 * transferred, local mbufs never returned) → pool = ns * BS.
@@ -248,7 +279,7 @@ int main(int argc, char **argv)
 			sa[s].nq_own = base + (s < rem);
 			sa[s].pkt_len = pkt_len;
 			sa[s].mp = mp;
-			rte_eal_remote_launch(sender, &sa[s], lc[2 + s]);
+			rte_eal_remote_launch(sender, &sa[s], lc[3 + s]);
 		}
 	} else {
 		/* more senders than queues: sender s shares queue s % tq */
@@ -258,7 +289,7 @@ int main(int argc, char **argv)
 			sa[s].nq_own = 1;
 			sa[s].pkt_len = pkt_len;
 			sa[s].mp = mp;
-			rte_eal_remote_launch(sender, &sa[s], lc[2 + s]);
+			rte_eal_remote_launch(sender, &sa[s], lc[3 + s]);
 		}
 	}
 
@@ -270,7 +301,7 @@ int main(int argc, char **argv)
 		g_running = 0;
 	}
 	for (uint32_t s = 0; s < ns; s++)
-		rte_eal_wait_lcore(lc[2 + s]);
+		rte_eal_wait_lcore(lc[3 + s]);
 
 	/* stop the flush/collect workers FIRST: shadow rings are SC_DEQ and
 	 * shm rings are SP_ENQ — a concurrent final flush from main would
@@ -278,6 +309,7 @@ int main(int argc, char **argv)
 	g_running = 0;
 	rte_eal_wait_lcore(lc[0]);
 	rte_eal_wait_lcore(lc[1]);
+	rte_eal_wait_lcore(lc[2]);
 
 	/* final flush alone (bounded: gives up if the peer stopped) */
 	rte_ub_ring_flush_tx_all(g_h);
