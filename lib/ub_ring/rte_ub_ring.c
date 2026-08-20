@@ -624,10 +624,12 @@ uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h, uint32_t q, void *
 uint16_t rte_ub_ring_send_burst_pi(struct rte_ub_ring_handle *h, uint32_t q,
 		const uint32_t *pi, void **b, uint16_t n)
 { if(!h||q>=h->total_queues||!b||!pi||!n)return 0; void *e[n];uint16_t c=0;
-  /* caller-provided pi (from alloc_buf); offset from the header */
+  /* caller-provided pi; offset by LOCAL pointer arithmetic — the
+   * header lives in remote shm (non-cacheable), never read it on
+   * the hot path */
   for(uint16_t i=0;i<n;i++){if(!b[i])return 0;
-  struct ub_ring_buf_hdr *hd=ub_ring_buf_hdr(b[i]);
-  e[c++]=ub_ring_elem_pack((uint8_t)pi[i],hd->offset);}
+  e[c++]=ub_ring_elem_pack((uint8_t)pi[i],
+	  ub_ring_buf_off(h->peers[pi[i]].data_buf_area,b[i]));}
   return (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,c,NULL); }
 uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
 { if(!h||q>=h->total_queues||!b||!n)return 0; void *e[n];
@@ -671,9 +673,20 @@ mp_send_pack(struct rte_ub_ring_handle *h, uint32_t q, const uint32_t *pi,
 	for (uint16_t i = 0; i < n; i++) {
 		if (!b[i])
 			return 0;
-		struct ub_ring_buf_hdr *hd = ub_ring_buf_hdr(b[i]);
-		uint32_t ni = use_pi ? pi[i] : hd->node_index;
-		e[c++] = ub_ring_elem_pack((uint8_t)ni, hd->offset);
+		uint32_t ni;
+		if (use_pi)
+			ni = pi[i];
+		else {
+			/* non-pi variant needs the owner from the header —
+			 * cold path in the demo */
+			struct ub_ring_buf_hdr *hd = ub_ring_buf_hdr(b[i]);
+			ni = hd->node_index;
+		}
+		/* offset by LOCAL pointer arithmetic — the header lives in
+		 * remote shm (non-cacheable), never read it on the hot
+		 * path */
+		e[c++] = ub_ring_elem_pack((uint8_t)ni,
+			ub_ring_buf_off(h->peers[ni].data_buf_area, b[i]));
 	}
 	return (uint16_t)rte_ring_enqueue_burst(h->shadow_tx[q], e, c, NULL);
 }
