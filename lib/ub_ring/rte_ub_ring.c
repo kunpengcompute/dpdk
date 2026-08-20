@@ -688,21 +688,24 @@ uint16_t rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, voi
 { if(!h||!h->mpmc_enabled||q>=h->total_queues)return 0;return (uint16_t)rte_ring_dequeue_burst(h->shadow_rx[q],(void**)b,n,NULL); }
 uint64_t rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 	if (!h || !h->mpmc_enabled || q >= h->total_queues) return 0;
-	/* shadow holds encoded {pi, offset} elements — move directly */
-	void *elems[64]; uint16_t n; uint64_t moved = 0;
-	while ((n = (uint16_t)rte_ring_dequeue_burst(h->shadow_tx[q], (void**)elems, 64, NULL)) > 0) {
-		uint16_t s = (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q], elems, n, NULL);
-		if (s < n) {
-			/* real ring full — put unsent back to shadow for retry */
-			for (uint16_t i = s; i < n; i++)
-				rte_ring_enqueue_burst(h->shadow_tx[q], &elems[i], 1, NULL);
-			break;
-		}
-		moved += s;
+	/* one burst per call: the flush lcore sweeps every queue once
+	 * per round — same pattern as collect's one-batch-per-ring.
+	 * Bounded work keeps its per-second poll accounting alive */
+	void *elems[512];
+	uint16_t n = (uint16_t)rte_ring_dequeue_burst(
+		h->shadow_tx[q], (void**)elems, 512, NULL);
+	if (n == 0)
+		return 0;
+	uint16_t s = (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],
+		elems, n, NULL);
+	if (s < n) {
+		/* real ring full — put unsent back to shadow for retry */
+		for (uint16_t i = s; i < n; i++)
+			rte_ring_enqueue_burst(h->shadow_tx[q], &elems[i], 1, NULL);
 	}
-	if (moved)
-		UB_RING_FLOW_N("flush_tx", moved);
-	return moved;
+	if (s)
+		UB_RING_FLOW_N("flush_tx", s);
+	return s;
 }
 
 void rte_ub_ring_flush_tx_all(struct rte_ub_ring_handle *h)

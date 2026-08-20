@@ -123,7 +123,7 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
 	void *nb = NULL;
 	uint32_t nb_pi = 0;
 	if (m->next) {
-		nb = enc(m->next, pi, h, &nb_pi);
+		nb = enc(m->next, pi, elt_size, h, &nb_pi);
 		if (!nb) { rte_ub_ring_free_buf(h, buf); return NULL; }
 	}
 
