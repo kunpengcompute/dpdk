@@ -26,7 +26,7 @@ shm 布局：`metadata → 2×nq 个 1M 深收发环 → return 环 → 数据�
 
 | 资源 | 创建者 | 规格 | flags | 生产者（线程） | 消费者（线程） |
 |---|---|---|---|---|---|
-| 本地 data ring `data_{shm}` | user_init | **mx** 深，每 provider 1 个，元素=偏移量 | 0（**MP/MC**） | collect 线程 + sender 失败回退 free_buf（多个，MP） | n 个 sender 的 alloc_buf（多个，MC） |
+| 本地 data ring `data_{shm}` | user_init | **mx** 深，每 provider 1 个，元素=打包的 {pi,offset}（与其他环格式统一） | 0（**MP/MC**） | collect 线程 + sender 失败回退 free_buf（多个，MP） | n 个 sender 的 alloc_buf（多个，MC，经 per-lcore cache 批量取） |
 | shadow_tx `stx{q}` | enable_mpmc | 1M 深，每队列 | SC_DEQ（**MP/SC**） | n 个 sender（MP） | flush 线程（SC） |
 | shadow_rx `srx{q}` | enable_mpmc | 1M 深，每队列 | SP_ENQ（**SP/MC**） | flush 线程（SP） | rx 线程（MC，**demo 未用**） |
 | tx mempool `tx` | client main | 32×n 个 mbuf，**cache=0** | MP/MC ring backend | —（不回收） | n 个 sender 启动时各取 32 个，持有全程 |

@@ -416,6 +416,8 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		 * data ring. Element 0 is reserved: the packed chain value
 		 * 0 doubles as the NULL terminator, so no buffer may live
 		 * at offset 0 */
+		/* elements packed {pi, off} like every other ring — no
+		 * format conversion anywhere on the data path */
 		for(uint32_t idx=1;idx<mx;idx+=64){void*e[64];uint32_t n=RTE_MIN(64u,mx-idx);
 			for(uint32_t k=0;k<n;k++){
 				struct ub_ring_buf_hdr *hd=(struct ub_ring_buf_hdr*)((char*)ba+(size_t)(idx+k)*elt);
@@ -423,7 +425,7 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 				hd->offset=(uint32_t)((idx+k)*elt);
 				hd->elt_size=elt;
 				hd->magic=UB_RING_BUF_MAGIC;
-				e[k]=(void*)(uintptr_t)((idx+k)*elt);
+				e[k]=ub_ring_elem_pack((uint8_t)pi,(idx+k)*elt);
 			}
 			rte_ring_enqueue_burst(h->data_rings[pi],e,n,NULL);}
 
@@ -472,7 +474,10 @@ rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h, uint32_t pi)
 	}
 	void *e = c->offs[--c->len];
 	UB_RING_FLOW_N("alloc_buf", 1);
-	return ub_ring_buf_ptr(h->peers[pi].data_buf_area, (uintptr_t)e);
+	/* elements are packed {pi, off}; this ring only holds pi's
+	 * buffers, so just strip the node byte and use the caller's pi */
+	return ub_ring_buf_ptr(h->peers[pi].data_buf_area,
+		ub_ring_elem_get_offset(e));
 }
 
 void
@@ -515,7 +520,7 @@ rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
 	 * Ownership comes from the 128B header (O(1), no node scan) */
 	struct ub_ring_buf_hdr *hd = ub_ring_buf_hdr(buf);
 	uint32_t ni = hd->node_index;
-	void *e = (void *)(uintptr_t)hd->offset;
+	void *e = ub_ring_elem_pack((uint8_t)ni, hd->offset);
 	/* user: return to the owning provider's local data ring (MP —
 	 * concurrent with collect); provider: return via its OWN return
 	 * ring as a packed {pi, offset} element */
@@ -537,46 +542,43 @@ rte_ub_ring_collect(struct rte_ub_ring_handle *h)
 {
 	if (!h || !h->data_rings) return 0;
 	uint64_t total = 0;
-	for (uint32_t i = 0; i < UB_RING_MAX_NODES; i++) {
+	/* one batch per return ring, one pass over the ACTUAL nodes —
+	 * bounded work per call, so the caller's poll loop keeps ticking
+	 * (draining everything would starve its per-second accounting at
+	 * high return rates) */
+	for (uint32_t i = 0; i < h->nb_nodes; i++) {
 		struct rte_ring *rr = h->peers[i].return_ring;
 		if (!rr) continue;
 		void *elems[64];
-		uint64_t tot = 0;
-		uint16_t n;
-		while ((n = (uint16_t)rte_ring_dequeue_burst(rr, elems, 64, NULL)) > 0) {
-			tot += n;
-			/* elements carry {pi, offset}: the return ring
-			 * belongs to the provider that performed the return,
-			 * the buffer belongs to pi — enqueue the offset to
-			 * pi's local data ring */
-			uint16_t k = 0;
-			while (k < n) {
-				uint32_t pi = ub_ring_elem_get_node(elems[k]);
-				/* group consecutive same-owner elements into
-				 * one bulk MP enqueue */
-				uint16_t run = 1;
-				while (k + run < n &&
-				       ub_ring_elem_get_node(elems[k + run]) == pi)
-					run++;
-				if (!h->data_rings[pi]) {
-					UB_RING_LOG(ERR,
-						"collect: no data ring for pi=%u (leak!)",
-						pi);
-					k += run;
-					continue;
-				}
-				void *offs[64];
-				for (uint16_t j = 0; j < run; j++)
-					offs[j] = (void *)(uintptr_t)
-						ub_ring_elem_get_offset(elems[k + j]);
-				rte_ring_mp_enqueue_bulk(h->data_rings[pi],
-					offs, run, NULL);
+		uint16_t n = (uint16_t)rte_ring_dequeue_burst(rr, elems, 64, NULL);
+		if (n == 0)
+			continue;
+		/* elements carry {pi, offset}: the return ring belongs to
+		 * the provider that performed the return, the buffer
+		 * belongs to pi — move the packed elements AS-IS into
+		 * pi's local data ring (same format, no conversion) */
+		uint16_t k = 0;
+		while (k < n) {
+			uint32_t pi = ub_ring_elem_get_node(elems[k]);
+			/* group consecutive same-owner elements into one
+			 * bulk MP enqueue */
+			uint16_t run = 1;
+			while (k + run < n &&
+			       ub_ring_elem_get_node(elems[k + run]) == pi)
+				run++;
+			if (!h->data_rings[pi]) {
+				UB_RING_LOG(ERR,
+					"collect: no data ring for pi=%u (leak!)",
+					pi);
 				k += run;
+				continue;
 			}
+			rte_ring_mp_enqueue_bulk(h->data_rings[pi],
+				&elems[k], run, NULL);
+			k += run;
 		}
-		if (tot)
-			UB_RING_FLOW_N("collect", tot);
-		total += tot;
+		total += n;
+		UB_RING_FLOW_N("collect", n);
 	}
 	return total;
 }
