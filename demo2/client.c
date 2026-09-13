@@ -2,13 +2,15 @@
  * Client — N send lcores + 1 flush lcore + collect 2-stage pipeline
  * (fetch + dispatch), continuous TX with per-second rate output on
  * every lcore.
- * Run: ./client --no-huge -l 1-6 --ns=2 --pktlen=500 [--time=10]
+ * Run: ./client --no-huge -l 1-6 --ns=2 --pktlen=500 [--pn=a,b] [--un=c,d] [--time=10]
  *      ns     = number of sender lcores (any value vs server queues:
  *               ns <= nq → contiguous queue blocks, RR within block;
  *               ns >  nq → sender s shares queue s % nq)
  *               (needs ns+3 lcores: flush + fetch + dispatch + senders)
  *      pktlen = packet payload size (<= RTE_MBUF_DEFAULT_BUF_SIZE - headroom)
  *      time   = run duration in seconds (0 = run until Ctrl+C)
+ *      pn/un  = UB provider/user node names: comma-separated list or
+ *               repeated --pn/--un (must match the server)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +31,8 @@
 static volatile sig_atomic_t g_running = 1;
 static struct rte_ub_ring_handle *g_h;
 static uint32_t g_nb_q;
+static const char **g_pn;  /* provider node names, argv order */
+static int g_nb_pn;        /* number of providers */
 
 static void on_sigint(int sig)
 {
@@ -56,11 +60,113 @@ static uint32_t app_opt_uint(int *argc, char **argv, const char *opt,
 	return def;
 }
 
+/* parse "--opt=STR" BEFORE eal_init and strip it from argv (see above) */
+static const char *app_opt_str(int *argc, char **argv, const char *opt,
+			     const char *def)
+{
+	for (int i = 1; i < *argc; i++) {
+		size_t l = strlen(opt);
+		if (strncmp(argv[i], opt, l) == 0 && argv[i][l] == '=') {
+			const char *v = argv[i] + l + 1;
+			for (int j = i; j < *argc - 1; j++)
+				argv[j] = argv[j + 1];
+			(*argc)--;
+			return v;	/* points into argv (never freed) */
+		}
+	}
+	return def;
+}
+
+/* parse "--opt=a,b,c" (comma-separated and/or repeated --opt=) BEFORE
+ * eal_init; strips EVERY occurrence from argv so EAL never sees them.
+ * Fills out[] with up to maxn names (strdup'd, never freed — demo).
+ * Falls back to a single default. Returns the count. */
+static int app_opt_strs(int *argc, char **argv, const char *opt,
+			const char **out, int maxn, const char *def)
+{
+	int n = 0;
+	for (int i = 1; i < *argc; i++) {
+		size_t l = strlen(opt);
+		if (strncmp(argv[i], opt, l) == 0 && argv[i][l] == '=') {
+			char *copy = strdup(argv[i] + l + 1);
+			char *save = copy;
+			for (char *t = strtok_r(copy, ",", &save);
+			     t && n < maxn; t = strtok_r(NULL, ",", &save))
+				out[n++] = strdup(t);
+			free(copy);
+			for (int j = i; j < *argc - 1; j++)
+				argv[j] = argv[j + 1];
+			(*argc)--;
+			i--;	/* another --opt may sit in this slot now */
+		}
+	}
+	if (n == 0) {
+		out[0] = def;
+		return 1;
+	}
+	return n;
+}
+
+/* join names into a comma-separated string for the startup banner */
+static void join_names(char *buf, size_t sz, const char **v, int n)
+{
+	buf[0] = '\0';
+	for (int i = 0; i < n; i++) {
+		if (i)
+			strncat(buf, ",", sz - strlen(buf) - 1);
+		strncat(buf, v[i], sz - strlen(buf) - 1);
+	}
+}
+
+/* provider node name serving global queue q ("?" if out of range) */
+static const char *q_provider_name(uint32_t q)
+{
+	uint32_t pi = rte_ub_ring_queue_to_provider(g_h, q);
+	return (pi < (uint32_t)g_nb_pn) ? g_pn[pi] : "?";
+}
+
+/* reverse-map global queue q to its index WITHIN the owning provider
+ * (the order the provider exported its queues = its server worker id) */
+static uint32_t q_local_index(uint32_t q)
+{
+	uint32_t pi = rte_ub_ring_queue_to_provider(g_h, q);
+	for (uint32_t sq = 0; ; sq++) {
+		uint32_t tx, rx;
+		if (rte_ub_ring_get_queue_mapping(g_h, pi, sq, &tx, &rx) < 0)
+			break;
+		if (tx == q)
+			return sq;
+	}
+	return (uint32_t)-1;
+}
+
+/* print this worker's TX assignment: every queue it sends into, each
+ * with the queue's GLOBAL index, the owning provider node name, and
+ * the queue's LOCAL index within that provider (= the server worker
+ * thread serving it). all = 1 -> the worker touches every queue. */
+static void log_assign(const char *role, uint32_t q0, uint32_t nq, int all)
+{
+	printf("[%s] lcore %u: sends into", role, rte_lcore_id());
+	if (all) {
+		for (uint32_t q = 0; q < g_nb_q; q++)
+			printf(" queue %u (provider %s local %u)",
+			       q, q_provider_name(q), q_local_index(q));
+	} else {
+		for (uint32_t i = 0; i < nq; i++) {
+			uint32_t q = q0 + i;
+			printf(" queue %u (provider %s local %u)",
+			       q, q_provider_name(q), q_local_index(q));
+		}
+	}
+	printf("\n");
+}
+
 static int flush_worker(void *arg)
 {
 	(void)arg;
 	/* TX flush only: this demo never receives, so rx flush is skipped
 	 * on the hot path (a one-shot final flush_rx still runs at exit) */
+	log_assign("flush", 0, 0, 1);
 	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
 	uint64_t loops = 0, work = 0;
 	while (g_running) {
@@ -93,16 +199,22 @@ static int flush_worker(void *arg)
 static int collect_fetch_worker(void *arg)
 {
 	(void)arg;
+	printf("[collect_fetch] lcore %u: returns only, sends to no queue\n",
+		rte_lcore_id());
 	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
-	uint64_t loops = 0, work = 0;
+	uint64_t loops = 0, work = 0, fetched = 0;
 	while (g_running) {
 		loops++;
-		work += rte_ub_ring_collect_fetch(g_h) > 0;
+		uint64_t f = rte_ub_ring_collect_fetch(g_h);
+		work += f > 0;
+		fetched += f;
 
 		uint64_t now = rte_rdtsc();
 		if (now - last >= hz) {
-			printf("[poll collect_fetch] loops=%llu work=%llu "
+			printf("[poll collect_fetch] fetched %llu/s from provider "
+				"return rings -> mid ring | loops=%llu work=%llu "
 				"idle=%llu busy=%.1f%%\n",
+				(unsigned long long)fetched,
 				(unsigned long long)loops,
 				(unsigned long long)work,
 				(unsigned long long)(loops - work),
@@ -111,6 +223,7 @@ static int collect_fetch_worker(void *arg)
 			last = now;
 			loops = 0;
 			work = 0;
+			fetched = 0;
 		}
 	}
 	return 0;
@@ -121,16 +234,22 @@ static int collect_fetch_worker(void *arg)
 static int collect_dispatch_worker(void *arg)
 {
 	(void)arg;
+	printf("[collect_dispatch] lcore %u: returns only, sends to no queue\n",
+		rte_lcore_id());
 	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
-	uint64_t loops = 0, work = 0;
+	uint64_t loops = 0, work = 0, dispatched = 0;
 	while (g_running) {
 		loops++;
-		work += rte_ub_ring_collect_dispatch(g_h) > 0;
+		uint64_t f = rte_ub_ring_collect_dispatch(g_h);
+		work += f > 0;
+		dispatched += f;
 
 		uint64_t now = rte_rdtsc();
 		if (now - last >= hz) {
-			printf("[poll collect_dispatch] loops=%llu work=%llu "
+			printf("[poll collect_dispatch] dispatched %llu/s from mid "
+				"-> provider data rings | loops=%llu work=%llu "
 				"idle=%llu busy=%.1f%%\n",
+				(unsigned long long)dispatched,
 				(unsigned long long)loops,
 				(unsigned long long)work,
 				(unsigned long long)(loops - work),
@@ -139,6 +258,7 @@ static int collect_dispatch_worker(void *arg)
 			last = now;
 			loops = 0;
 			work = 0;
+			dispatched = 0;
 		}
 	}
 	return 0;
@@ -167,11 +287,12 @@ static int sender(void *a)
 			rte_lcore_id());
 		return 0;
 	}
+	log_assign("sender", sa->q0, sa->nq_own, 0);
 
 	/* send round-robin over this sender's queues forever,
 	 * print the rate once per second */
 	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc(), window = 0;
-	uint64_t loops = 0, work = 0;
+	uint64_t loops = 0, work = 0, fails = 0;
 	while (g_running) {
 		for (uint32_t i = 0; i < sa->nq_own && g_running; i++) {
 			uint32_t q = sa->q0 + i;
@@ -181,6 +302,7 @@ static int sender(void *a)
 					&burst[sent], nb_built - sent);
 				sent += s;
 				window += s;
+				fails += s == 0;
 				loops++;
 				work += s > 0;
 
@@ -189,9 +311,10 @@ static int sender(void *a)
 					double secs = (double)(now - last) / hz;
 					double mpps = window / secs / 1e6;
 					printf("[Cli lc%u] %.2f Mpps, %.2f Mbps | "
-						"loops=%llu work=%llu busy=%.1f%%\n",
+						"fail=%llu loops=%llu work=%llu busy=%.1f%%\n",
 						rte_lcore_id(), mpps,
 						mpps * sa->pkt_len * 8,
+						(unsigned long long)fails,
 						(unsigned long long)loops,
 						(unsigned long long)work,
 						loops ? 100.0 * (double)work /
@@ -200,6 +323,7 @@ static int sender(void *a)
 					window = 0;
 					loops = 0;
 					work = 0;
+					fails = 0;
 				}
 			}
 		}
@@ -222,6 +346,11 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	uint32_t duration = app_opt_uint(&argc, argv, "--time", 0);
+	const char *pn[UB_RING_MAX_NODES], *un[UB_RING_MAX_NODES];
+	int nb_pn = app_opt_strs(&argc, argv, "--pn", pn, UB_RING_MAX_NODES,
+				      "master");
+	int nb_un = app_opt_strs(&argc, argv, "--un", un, UB_RING_MAX_NODES,
+				      "worker1");
 	rte_eal_init(argc, argv);
 	signal(SIGINT, on_sigint);
 	signal(SIGTERM, on_sigint);
@@ -238,10 +367,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	const char *pn[] = {"master"}, *un[] = {"worker1"};
 	uint32_t elt = sizeof(struct rte_mbuf) + RTE_MBUF_DEFAULT_BUF_SIZE;
 	struct rte_ub_ring_handle *h = rte_ub_ring_user_init(
-		pn, 1, un, 1, "region1", "ubring", elt);
+		pn, nb_pn, un, nb_un, "region1", "ubring", elt);
 	rte_ub_ring_enable_mpmc(h);
 	int pid = rte_eth_ub_ring_attach("client_eth", h);
 
@@ -250,10 +378,13 @@ int main(int argc, char **argv)
 	rte_eth_dev_configure(pid, tq, tq, &c);
 	rte_eth_dev_start(pid);
 
-	printf("\n===== Client (%u queues, %u sender lcores, %uB pkts, %s) =====\n\n",
-		tq, ns, pkt_len, duration ? "timed" : "Ctrl+C to stop");
+	char pns[512] = "", uns[512] = "";
+	join_names(pns, sizeof pns, pn, nb_pn);
+	join_names(uns, sizeof uns, un, nb_un);
+	printf("\n===== Client (%u queues, %u sender lcores, %uB pkts, %s, pn=[%s] un=[%s]) =====\n\n",
+		tq, ns, pkt_len, duration ? "timed" : "Ctrl+C to stop", pns, uns);
 
-	g_h = h; g_nb_q = tq;
+	g_h = h; g_nb_q = tq; g_pn = pn; g_nb_pn = nb_pn;
 	rte_eal_remote_launch(flush_worker, NULL, lc[0]);
 	rte_eal_remote_launch(collect_fetch_worker, NULL, lc[1]);
 	rte_eal_remote_launch(collect_dispatch_worker, NULL, lc[2]);

@@ -9,15 +9,25 @@ if get_option('buildtype').startswith('debug')
     cflags += '-DUB_RING_FLOW_TRACE'
 endif
 
-# External ubsmem dependency
-ubsmem_inc = include_directories('/usr/local/ubs_mem/include')
-includes += ubsmem_inc
-
-ubsmem_lib = cc.find_library('ubsm_sdk', dirs: ['/usr/local/ubs_mem/lib'],
-                              required: false)
-if ubsmem_lib.found()
-    ext_deps += ubsmem_lib
-else
-    ext_deps += declare_dependency(
-        link_args: ['-L/usr/local/ubs_mem/lib', '-lubsm_sdk'])
+# External ubsmem dependency.
+# On the target machine ubs_mem.h ships in the default include path
+# (/usr/include) and libubsm_sdk.so in the default lib path (/usr/lib64).
+# The legacy /usr/local/ubs_mem staging layout is still probed as a
+# fallback so both layouts build without further configuration.
+ubsmem_inc_dir = '/usr/local/ubs_mem/include'
+if cc.has_header('ubs_mem.h')
+    ubsmem_inc_dir = ''   # found on the default include path
 endif
+if ubsmem_inc_dir != ''
+    includes += include_directories(ubsmem_inc_dir)
+endif
+
+ubsmem_lib = cc.find_library('ubsm_sdk',
+                             dirs: ['/usr/lib64', '/usr/lib',
+                                    '/usr/local/ubs_mem/lib'],
+                             required: false)
+if not ubsmem_lib.found()
+    error('libubsm_sdk.so not found: checked /usr/lib64, /usr/lib and ' +
+          '/usr/local/ubs_mem/lib')
+endif
+ext_deps += ubsmem_lib

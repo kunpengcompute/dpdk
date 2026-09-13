@@ -281,8 +281,20 @@ rte_ub_ring_provider_init(const char **pn, uint32_t np, const char **un, uint32_
 	write_meta(om,tot,nq,mi,qd,sz,ms,ras,my);
 	for(uint32_t q=0;q<nq;q++){om->queue_offsets[q]=ms+q*rs;om->queue_offsets[nq+q]=ms+(nq+q)*rs;}
 	om->state|=UB_RING_STATE_META_READY; h->peers[mi].return_ring=NULL; h->peers[mi].data_buf_area=NULL;
-	UB_RING_LOG(INFO,"waiting for %u provider shms...",np);
-	if (wait_shms(pre,pn,np)<0){UB_RING_LOG(ERR,"timeout");goto fail_reg;}
+	/* Wait for the USER to initialize OUR shm (data rings) BEFORE
+	 * mapping any peer. A peer may still be recreating its own shm
+	 * (dealloc+alloc) and an early map pins it, so its recreate
+	 * fails with IN_USING. The user only initializes us after it
+	 * saw ALL provider shms, so mapping peers afterwards is safe. */
+	UB_RING_LOG(INFO,"waiting for user to init my shm...");
+	{
+		struct ub_ring_metadata *m=(struct ub_ring_metadata*)sh;
+		int wi; for(wi=0;wi<UB_RING_POLL_S*20;wi++){
+			if(m->state&UB_RING_STATE_DATA_RING_READY)break;
+			usleep(UB_RING_POLL_US);
+		}
+		if(wi>=UB_RING_POLL_S*20){UB_RING_LOG(ERR,"user did not init my shm in %ds",UB_RING_POLL_S);goto fail_reg;}
+	}
 	for(uint32_t i=0;i<np;i++){if(!strcmp(pn[i],my))continue;
 		char pn2[128];snprintf(pn2,128,"%s_%s",pre,pn[i]);ubsmem_shmem_desc_t dl[32];uint32_t dc=32;uint64_t ps=0;
 		ubsmem_shmem_list_lookup(pre,dl,&dc);for(uint32_t k=0;k<dc;k++)if(!strcmp(dl[k].name,pn2)){ps=dl[k].size;break;}if(!ps)continue;

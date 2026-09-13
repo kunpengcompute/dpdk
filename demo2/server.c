@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Server — N workers (one per queue) + 1 drain lcore, continuous RX
  * with per-second rate output on every worker.
- * Run: ./server --no-huge -l 1-6 --nq=4 [--time=10]
+ * Run: ./server --no-huge -l 1-6 --nq=4 [--pn=a,b] [--un=c,d] [--time=10]
  *      nq   = number of queues/workers (needs nq+1 lcores: workers+drain)
+ *      pn/un = UB provider/user node names: comma-separated list or
+ *              repeated --pn/--un (must match the client)
  *      time = run duration in seconds (0 = run until Ctrl+C)
  */
 #include <stdio.h>
@@ -49,6 +51,64 @@ static uint32_t app_opt_uint(int *argc, char **argv, const char *opt,
 	return def;
 }
 
+/* parse "--opt=STR" BEFORE eal_init and strip it from argv (see above) */
+static const char *app_opt_str(int *argc, char **argv, const char *opt,
+			     const char *def)
+{
+	for (int i = 1; i < *argc; i++) {
+		size_t l = strlen(opt);
+		if (strncmp(argv[i], opt, l) == 0 && argv[i][l] == '=') {
+			const char *v = argv[i] + l + 1;
+			for (int j = i; j < *argc - 1; j++)
+				argv[j] = argv[j + 1];
+			(*argc)--;
+			return v;	/* points into argv (never freed) */
+		}
+	}
+	return def;
+}
+
+/* parse "--opt=a,b,c" (comma-separated and/or repeated --opt=) BEFORE
+ * eal_init; strips EVERY occurrence from argv so EAL never sees them.
+ * Fills out[] with up to maxn names (strdup'd, never freed — demo).
+ * Falls back to a single default. Returns the count. */
+static int app_opt_strs(int *argc, char **argv, const char *opt,
+			const char **out, int maxn, const char *def)
+{
+	int n = 0;
+	for (int i = 1; i < *argc; i++) {
+		size_t l = strlen(opt);
+		if (strncmp(argv[i], opt, l) == 0 && argv[i][l] == '=') {
+			char *copy = strdup(argv[i] + l + 1);
+			char *save = copy;
+			for (char *t = strtok_r(copy, ",", &save);
+			     t && n < maxn; t = strtok_r(NULL, ",", &save))
+				out[n++] = strdup(t);
+			free(copy);
+			for (int j = i; j < *argc - 1; j++)
+				argv[j] = argv[j + 1];
+			(*argc)--;
+			i--;	/* another --opt may sit in this slot now */
+		}
+	}
+	if (n == 0) {
+		out[0] = def;
+		return 1;
+	}
+	return n;
+}
+
+/* join names into a comma-separated string for the startup banner */
+static void join_names(char *buf, size_t sz, const char **v, int n)
+{
+	buf[0] = '\0';
+	for (int i = 0; i < n; i++) {
+		if (i)
+			strncat(buf, ",", sz - strlen(buf) - 1);
+		strncat(buf, v[i], sz - strlen(buf) - 1);
+	}
+}
+
 struct targ { int pid; uint32_t qid; };
 
 /* drain the dummy pool back to the providers' return rings on its own
@@ -59,15 +119,19 @@ static int drain_worker(void *a)
 {
 	int pid = *(int *)a;
 	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
-	uint64_t loops = 0, work = 0;
+	uint64_t loops = 0, work = 0, returned = 0;
 	while (g_running) {
+		uint64_t r = rte_eth_ub_ring_drain(pid);
 		loops++;
-		work += rte_eth_ub_ring_drain(pid) > 0;
+		work += r > 0;
+		returned += r;
 
 		uint64_t now = rte_rdtsc();
 		if (now - last >= hz) {
-			printf("[poll drain] loops=%llu work=%llu "
+			printf("[poll drain] returned %llu/s to own return ring "
+				"(client collect pulls it) | loops=%llu work=%llu "
 				"idle=%llu busy=%.1f%%\n",
+				(unsigned long long)returned,
 				(unsigned long long)loops,
 				(unsigned long long)work,
 				(unsigned long long)(loops - work),
@@ -76,6 +140,7 @@ static int drain_worker(void *a)
 			last = now;
 			loops = 0;
 			work = 0;
+			returned = 0;
 		}
 	}
 	return 0;
@@ -109,9 +174,10 @@ static int worker(void *a)
 		if (now - last >= hz) {
 			double secs = (double)(now - last) / hz;
 			double mpps = window / secs / 1e6;
-			printf("[Srv q%u] %.2f Mpps, %.2f Mbps | "
-				"loops=%llu work=%llu busy=%.1f%%\n",
-				ta->qid, mpps, win_bytes / secs * 8 / 1e6,
+			printf("[Srv q%u] %.2f Mpps (freed %llu/s to dummy_pool), "
+				"%.2f Mbps | loops=%llu work=%llu busy=%.1f%%\n",
+				ta->qid, mpps, (unsigned long long)window,
+				win_bytes / secs * 8 / 1e6,
 				(unsigned long long)loops,
 				(unsigned long long)work,
 				loops ? 100.0 * (double)work /
@@ -134,6 +200,11 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	uint32_t duration = app_opt_uint(&argc, argv, "--time", 0);
+	const char *pn[UB_RING_MAX_NODES], *un[UB_RING_MAX_NODES];
+	int nb_pn = app_opt_strs(&argc, argv, "--pn", pn, UB_RING_MAX_NODES,
+				      "master");
+	int nb_un = app_opt_strs(&argc, argv, "--un", un, UB_RING_MAX_NODES,
+				      "worker1");
 	rte_eal_init(argc, argv);
 	signal(SIGINT, on_sigint);
 	signal(SIGTERM, on_sigint);
@@ -148,12 +219,14 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	printf("\n===== Server (%u queues, %u workers + 1 drain, %s) =====\n\n",
-		g_nq, g_nq, duration ? "timed" : "Ctrl+C to stop");
+	char pns[512] = "", uns[512] = "";
+	join_names(pns, sizeof pns, pn, nb_pn);
+	join_names(uns, sizeof uns, un, nb_un);
+	printf("\n===== Server (%u queues, %u workers + 1 drain, %s, pn=[%s] un=[%s]) =====\n\n",
+		g_nq, g_nq, duration ? "timed" : "Ctrl+C to stop", pns, uns);
 
-	const char *pn[] = {"master"}, *un[] = {"worker1"};
 	struct rte_ub_ring_handle *h = rte_ub_ring_provider_init(
-		pn, 1, un, 1, "region1", "ubring", 4UL*1024*1024*1024, g_nq, 1024*1024);
+		pn, nb_pn, un, nb_un, "region1", "ubring", 4UL*1024*1024*1024, g_nq, 1024*1024);
 	int pid = rte_eth_ub_ring_attach("server_eth", h);
 	struct rte_eth_conf c = { .rxmode = { .max_lro_pkt_size = RTE_ETHER_MAX_LEN } };
 	rte_eth_dev_configure(pid, g_nq, g_nq, &c);
