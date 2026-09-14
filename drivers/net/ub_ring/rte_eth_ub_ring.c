@@ -37,7 +37,7 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 	cnt += (n); \
 	if (now - last >= rte_get_tsc_hz()) { \
 		UB_RING_ETH_LOG(INFO, "[flow] %s: total=%" PRIu64 \
-			" (+%" PRIu64 "/s)", site, cnt, cnt - prev); \
+			" (+%" PRIu64 " pkts/s)", site, cnt, cnt - prev); \
 		prev = cnt; \
 		last = now; \
 	} \
@@ -63,7 +63,7 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 	cnt += (n); \
 	if (now - last >= rte_get_tsc_hz()) { \
 		UB_RING_ETH_LOG(ERR, "[loss] %s: +%" PRIu64 \
-			"/s dropped (%s)", site, cnt - prev, why); \
+			" pkts/s dropped (%s)", site, cnt - prev, why); \
 		prev = cnt; \
 		last = now; \
 	} \
@@ -309,7 +309,7 @@ static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 		raw[c]=buf; raw_pi[c]=pi_used; c++;
 	}
 	if(!c){
-		UB_RING_ETH_LOSS_ADD("eth_tx_enc", 1, "no free buffer anywhere");
+		UB_RING_ETH_LOSS_ADD("eth_tx_enc", nb, "no free buffer anywhere");
 		return 0;
 	}
 	/*

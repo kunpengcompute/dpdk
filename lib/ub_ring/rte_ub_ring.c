@@ -40,7 +40,7 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, INFO);
 	cnt += (n); \
 	if (now - last >= rte_get_tsc_hz()) { \
 		UB_RING_LOG(INFO, "[flow] %s: total=%" PRIu64 \
-			" (+%" PRIu64 "/s)", site, cnt, cnt - prev); \
+			" (+%" PRIu64 " pkts/s)", site, cnt, cnt - prev); \
 		prev = cnt; \
 		last = now; \
 	} \
@@ -68,7 +68,7 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, INFO);
 	cnt += (n); \
 	if (now - last >= rte_get_tsc_hz()) { \
 		UB_RING_LOG(ERR, "[loss] %s: +%" PRIu64 \
-			"/s dropped (%s)", site, cnt - prev, why); \
+			" pkts/s dropped (%s)", site, cnt - prev, why); \
 		prev = cnt; \
 		last = now; \
 	} \
@@ -498,13 +498,14 @@ rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h, uint32_t pi)
 		uint32_t n = rte_ring_mc_dequeue_burst(h->data_rings[pi],
 			c->offs, UB_RING_ALLOC_CACHE_SIZE, NULL);
 		if (n == 0) {
-			UB_RING_FLOW_WARN("alloc_buf FAIL pi=%u (data ring empty)", pi);
+			UB_RING_LOSS_ADD("alloc_buf_fail", 1, "data ring empty");
 			return NULL;
 		}
 		c->len = n;
+		/* count actual pkts pulled from the data ring on refill */
+		UB_RING_FLOW_N("alloc_buf", n);
 	}
 	void *e = c->offs[--c->len];
-	UB_RING_FLOW_N("alloc_buf", 1);
 	/* elements are packed {pi, off}; this ring only holds pi's
 	 * buffers, so just strip the node byte and use the caller's pi */
 	return ub_ring_buf_ptr(h->peers[pi].data_buf_area,

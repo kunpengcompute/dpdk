@@ -312,7 +312,7 @@ static int sender(void *a)
 					double secs = (double)(now - last) / hz;
 					double mpps = window / secs / 1e6;
 					printf("[Cli lc%u] %.2f Mpps, %.2f Mbps | "
-						"fail=%llu loops=%llu work=%llu busy=%.1f%%\n",
+						"fail_pkts=%llu loops=%llu work=%llu busy=%.1f%%\n",
 						rte_lcore_id(), mpps,
 						mpps * sa->pkt_len * 8,
 						(unsigned long long)fails,
