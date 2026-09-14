@@ -56,6 +56,19 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 #define UB_RING_ETH_FLOW_WARN(fmt, ...) do { } while (0)
 #endif
 
+/* loss counters: ALWAYS compiled (independent of UB_RING_FLOW_TRACE) */
+#define UB_RING_ETH_LOSS_ADD(site, n, why) do { \
+	static uint64_t cnt, prev, last; \
+	uint64_t now = rte_rdtsc(); \
+	cnt += (n); \
+	if (now - last >= rte_get_tsc_hz()) { \
+		UB_RING_ETH_LOG(ERR, "[loss] %s: +%" PRIu64 \
+			"/s dropped (%s)", site, cnt - prev, why); \
+		prev = cnt; \
+		last = now; \
+	} \
+} while (0)
+
 /* ---- temporary perf debug switch -------------------------------
  * UB_RING_ETH_NO_COPY: skip the enc() memcpy (mbuf + payload into
  * shm). The whole alloc → send → recv → return loop still runs, but
@@ -296,7 +309,7 @@ static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 		raw[c]=buf; raw_pi[c]=pi_used; c++;
 	}
 	if(!c){
-		UB_RING_ETH_FLOW_WARN("eth_tx: enc failed (no free buffer anywhere)");
+		UB_RING_ETH_LOSS_ADD("eth_tx_enc", 1, "no free buffer anywhere");
 		return 0;
 	}
 	/*
@@ -309,6 +322,8 @@ static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 	uint16_t s = rte_ub_ring_is_mpmc_enabled(h)
 		? rte_ub_ring_mp_send_burst_pi(h, rq->queue_id, raw_pi, raw, c)
 		: rte_ub_ring_send_burst_pi(h, rq->queue_id, raw_pi, raw, c);
+	if (s < c)
+		UB_RING_ETH_LOSS_ADD("eth_tx", c - s, "send backpressure (freed to data ring)");
 	for (uint16_t i = s; i < c; i++)
 		free_enc_chain(h, raw[i]);
 	if (s)

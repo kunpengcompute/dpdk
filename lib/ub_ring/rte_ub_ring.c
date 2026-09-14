@@ -59,6 +59,21 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_logtype, INFO);
 #define UB_RING_FLOW_WARN(fmt, ...) do { } while (0)
 #endif
 
+/* loss counters: ALWAYS compiled (independent of UB_RING_FLOW_TRACE) so
+ * every drop site on the buffer path shows up even in release builds.
+ * Each site prints at most one ERR line per second with the delta. */
+#define UB_RING_LOSS_ADD(site, n, why) do { \
+	static uint64_t cnt, prev, last; \
+	uint64_t now = rte_rdtsc(); \
+	cnt += (n); \
+	if (now - last >= rte_get_tsc_hz()) { \
+		UB_RING_LOG(ERR, "[loss] %s: +%" PRIu64 \
+			"/s dropped (%s)", site, cnt - prev, why); \
+		prev = cnt; \
+		last = now; \
+	} \
+} while (0)
+
 static const char *ubs_strerror(int rc)
 {
 	switch (rc) {
@@ -523,8 +538,10 @@ rte_ub_ring_return_burst(struct rte_ub_ring_handle *h, void **bufs, uint16_t nb)
 		e[i] = buf_elem(bufs[i]);
 	/* one bulk SP enqueue per drain pass instead of one CAS
 	 * per buffer (workers would serialize on the return ring) */
-	rte_ring_sp_enqueue_bulk(rr, e, nb, NULL);
-	UB_RING_FLOW_N("return_burst", nb);
+	uint16_t s = rte_ring_sp_enqueue_bulk(rr, e, nb, NULL);
+	if (s < nb)
+		UB_RING_LOSS_ADD("return_burst", nb - s, "own return ring full");
+	UB_RING_FLOW_N("return_burst", s);
 }
 
 void
@@ -541,13 +558,15 @@ rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
 	 * concurrent with collect); provider: return via its OWN return
 	 * ring as a packed {pi, offset} element */
 	if (h->data_rings && h->data_rings[ni]) {
-		rte_ring_mp_enqueue_bulk(h->data_rings[ni], &e, 1, NULL);
+		if (rte_ring_mp_enqueue_bulk(h->data_rings[ni], &e, 1, NULL) != 1)
+			UB_RING_LOSS_ADD("free_buf", 1, "own data ring full");
 		return;
 	}
 	struct rte_ring *rr = own_return_ring(h);
 	if (rr) {
 		void *pe = buf_elem(buf);
-		rte_ring_sp_enqueue_bulk(rr, &pe, 1, NULL);
+		if (rte_ring_sp_enqueue_bulk(rr, &pe, 1, NULL) != 1)
+			UB_RING_LOSS_ADD("free_buf", 1, "own return ring full");
 	} else {
 		UB_RING_LOG(ERR, "free_buf %p: no return ring (leak!)", buf);
 	}
@@ -569,9 +588,11 @@ rte_ub_ring_collect_fetch(struct rte_ub_ring_handle *h)
 		uint16_t n = (uint16_t)rte_ring_dequeue_burst(rr, elems, 512, NULL);
 		if (n == 0)
 			continue;
-		rte_ring_sp_enqueue_bulk(h->collect_mid, elems, n, NULL);
-		total += n;
-		UB_RING_FLOW_N("collect_fetch", n);
+		uint16_t s = rte_ring_sp_enqueue_bulk(h->collect_mid, elems, n, NULL);
+		if (s < n)
+			UB_RING_LOSS_ADD("collect_fetch", n - s, "collect_mid full (PERM LOSS)");
+		total += s;
+		UB_RING_FLOW_N("collect_fetch", s);
 	}
 	return total;
 }
@@ -604,8 +625,10 @@ rte_ub_ring_collect_dispatch(struct rte_ub_ring_handle *h)
 			k += run;
 			continue;
 		}
-		rte_ring_mp_enqueue_bulk(h->data_rings[pi],
+		uint16_t s = rte_ring_mp_enqueue_bulk(h->data_rings[pi],
 			&elems[k], run, NULL);
+		if (s < run)
+			UB_RING_LOSS_ADD("collect_dispatch", run - s, "data ring full (PERM LOSS)");
 		k += run;
 	}
 	UB_RING_FLOW_N("collect_dispatch", n);
@@ -631,7 +654,9 @@ uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h, uint32_t q, void *
 { if(!h||q>=h->total_queues||!b||!n)return 0; void *e[n];uint16_t c=0;
   /* fail-fast: any invalid buffer → send nothing (caller frees all) */
   for(uint16_t i=0;i<n;i++){if(!b[i])return 0;e[c++]=buf_elem(b[i]);}
-  return (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,c,NULL); }
+  uint16_t s=(uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,c,NULL);
+  if(s<c)UB_RING_LOSS_ADD("send_burst",c-s,"tx_ring full (backpressure)");
+  return s; }
 
 uint16_t rte_ub_ring_send_burst_pi(struct rte_ub_ring_handle *h, uint32_t q,
 		const uint32_t *pi, void **b, uint16_t n)
@@ -642,7 +667,9 @@ uint16_t rte_ub_ring_send_burst_pi(struct rte_ub_ring_handle *h, uint32_t q,
   for(uint16_t i=0;i<n;i++){if(!b[i])return 0;
   e[c++]=ub_ring_elem_pack((uint8_t)pi[i],
 	  ub_ring_buf_off(h->peers[pi[i]].data_buf_area,b[i]));}
-  return (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,c,NULL); }
+  uint16_t s=(uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,c,NULL);
+  if(s<c)UB_RING_LOSS_ADD("send_burst_pi",c-s,"tx_ring full (backpressure)");
+  return s; }
 uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
 { if(!h||q>=h->total_queues||!b||!n)return 0; void *e[n];
   uint16_t r=(uint16_t)rte_ring_dequeue_burst(h->rx_rings[q],e,n,NULL);
@@ -653,20 +680,39 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 	if (!h || h->mpmc_enabled) return -EINVAL;
 	h->shadow_tx = rte_zmalloc(NULL, h->total_queues * sizeof(void*), 0);
 	h->shadow_rx = rte_zmalloc(NULL, h->total_queues * sizeof(void*), 0);
-	if (!h->shadow_tx || !h->shadow_rx) return -ENOMEM;
+	if (!h->shadow_tx || !h->shadow_rx) {
+		UB_RING_LOG(ERR, "enable_mpmc: shadow array alloc failed "
+			"(rte_errno=%d %s)", rte_errno, rte_strerror(rte_errno));
+		return -ENOMEM;
+	}
 	for (uint32_t q = 0; q < h->total_queues; q++) {
 		/* 1M-deep shadow rings: senders may run far ahead of flush.
 		 * stx: MP/SC (n senders enqueue, flush lcore dequeues)
 		 * srx: SP/MC (flush lcore enqueues, rx lcores dequeue) */
-		char n[64]; snprintf(n,64,"stx%u",q); h->shadow_tx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SC_DEQ);
-		snprintf(n,64,"srx%u",q); h->shadow_rx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SP_ENQ);
-		if (!h->shadow_tx[q] || !h->shadow_rx[q]) return -ENOMEM;
+		char n[64]; snprintf(n,64,"stx%u",q);
+		h->shadow_tx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SC_DEQ);
+		if (!h->shadow_tx[q]) {
+			UB_RING_LOG(ERR, "enable_mpmc: stx%u create failed "
+				"(rte_errno=%d %s)", q, rte_errno, rte_strerror(rte_errno));
+			return -ENOMEM;
+		}
+		snprintf(n,64,"srx%u",q);
+		h->shadow_rx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SP_ENQ);
+		if (!h->shadow_rx[q]) {
+			UB_RING_LOG(ERR, "enable_mpmc: srx%u create failed "
+				"(rte_errno=%d %s)", q, rte_errno, rte_strerror(rte_errno));
+			return -ENOMEM;
+		}
 	}
 	/* collect pipeline mid ring: SPSC, 1M deep — may hold the whole
 	 * in-flight set between the fetch and dispatch stages */
 	h->collect_mid = rte_ring_create("cmid", 1024*1024,
 		rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-	if (!h->collect_mid) return -ENOMEM;
+	if (!h->collect_mid) {
+		UB_RING_LOG(ERR, "enable_mpmc: cmid create failed "
+			"(rte_errno=%d %s)", rte_errno, rte_strerror(rte_errno));
+		return -ENOMEM;
+	}
 	h->mpmc_enabled = true; return 0;
 }
 bool rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h) { return h&&h->mpmc_enabled; }
@@ -677,8 +723,10 @@ mp_send_pack(struct rte_ub_ring_handle *h, uint32_t q, const uint32_t *pi,
 {
 	if (!h || !h->mpmc_enabled || q >= h->total_queues || !b || !n)
 		return 0;
-	if (rte_ring_free_count(h->shadow_tx[q]) < n)
+	if (rte_ring_free_count(h->shadow_tx[q]) < n) {
+		UB_RING_LOSS_ADD("mp_send_pack", n, "shadow_tx full (backpressure)");
 		return 0; /* fail-fast */
+	}
 
 	void *e[n];
 	uint16_t c = 0;
@@ -726,7 +774,8 @@ uint64_t rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 	if (s < n) {
 		/* real ring full — put unsent back to shadow for retry */
 		for (uint16_t i = s; i < n; i++)
-			rte_ring_enqueue_burst(h->shadow_tx[q], &elems[i], 1, NULL);
+			if (rte_ring_enqueue_burst(h->shadow_tx[q], &elems[i], 1, NULL) != 1)
+				UB_RING_LOSS_ADD("flush_tx", 1, "shadow refill failed (PERM LOSS)");
 	}
 	if (s)
 		UB_RING_FLOW_N("flush_tx", s);

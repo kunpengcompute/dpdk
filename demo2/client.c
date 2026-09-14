@@ -20,6 +20,7 @@
 #include <rte_eal.h>
 #include <rte_launch.h>
 #include <rte_cycles.h>
+#include <rte_errno.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_ethdev.h>
@@ -370,7 +371,14 @@ int main(int argc, char **argv)
 	uint32_t elt = sizeof(struct rte_mbuf) + RTE_MBUF_DEFAULT_BUF_SIZE;
 	struct rte_ub_ring_handle *h = rte_ub_ring_user_init(
 		pn, nb_pn, un, nb_un, "region1", "ubring", elt);
-	rte_ub_ring_enable_mpmc(h);
+	int mrc = rte_ub_ring_enable_mpmc(h);
+	if (mrc) {
+		fprintf(stderr,
+			"rte_ub_ring_enable_mpmc FAILED: rc=%d rte_errno=%d (%s)\n",
+			mrc, rte_errno, rte_strerror(rte_errno));
+		return 1;
+	}
+	printf("MPMC pipeline OK (shadow_tx/shadow_rx/collect_mid created)\n");
 	int pid = rte_eth_ub_ring_attach("client_eth", h);
 
 	struct rte_eth_conf c = { .rxmode = { .max_lro_pkt_size = RTE_ETHER_MAX_LEN } };
