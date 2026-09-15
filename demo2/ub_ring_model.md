@@ -90,7 +90,7 @@ package "Server（m+1 lcores）" {
 TMP --> SND : 启动时各取 32 个 mbuf
 LDR --> SND : ① alloc_buf（MC 出队）
 SND --> DB : ① enc memcpy 拷贝进数据区
-SND --> STX : ② mp_send_burst_pi（MP 入队）
+SND --> STX : ② mp_send_elems（MP 入队 enc 产出的最终元素）
 STX --> FL : ③ flush_tx（SC 出队）
 FL --> STXR : ③ SP 入队
 STXR --> WK : ④ recv_burst（SC 出队）
@@ -124,7 +124,7 @@ participant "collect_dispatch lcore" as DI
 S -> LDR : ① alloc_buf（MC 出队偏移量）
 LDR --> S : buffer 地址 = 数据区 + 偏移
 S -> S : enc：memcpy mbuf → shm buffer 区
-S -> STX : ② mp_send_burst_pi（MP 入队 {pi,off}）
+S -> STX : ② mp_send_elems（MP 入队 enc 产出的 {pi,off}）
 F -> STX : ③ flush_tx（SC 出队）
 F -> TXR : ③ SP 入队
 W -> TXR : ④ recv_burst（SC 出队）

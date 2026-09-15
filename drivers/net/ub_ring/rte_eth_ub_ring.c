@@ -97,17 +97,21 @@ struct ub_ring_eth_internals {
 };
 
 static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
-		 struct rte_ub_ring_handle *h, uint32_t *pi_out)
+		 struct rte_ub_ring_handle *h)
 {
-	/* copy only header + priv + headroom + data (no tailroom) */
-	uint32_t need = sizeof(struct rte_mbuf) + m->priv_size +
-			m->data_off + m->data_len;
+	/* copy only header + priv + headroom + data (no tailroom), rounded
+	 * UP to 64B: the shm buffers sit in a NONCACHE region, so a
+	 * partial cacheline tail would trigger an extra remote
+	 * transaction on the fabric. The capacity check below uses the
+	 * same aligned size so the copy never crosses into the next
+	 * element */
+	uint32_t need = RTE_ALIGN_CEIL(sizeof(struct rte_mbuf) +
+			m->priv_size + m->data_off + m->data_len, 64);
 
 	/*
 	 * Try the target provider's data ring first; if exhausted, fall
-	 * back to any other node's data ring. The actual provider index
-	 * is returned in *pi_out so the caller can pack ring elements
-	 * correctly.
+	 * back to any other node's data ring. The chosen provider index
+	 * is packed into the returned element.
 	 *
 	 * elt_size is cached at queue setup — the element size is
 	 * user-defined and identical across all providers, so the hot
@@ -132,12 +136,13 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
 	}
 	if (!buf) return NULL;
 
-	/* encode chain first (recursive) */
-	void *nb = NULL;
-	uint32_t nb_pi = 0;
+	/* encode chain first (recursive): the child comes back as its
+	 * FINAL packed {pi, offset} element — exactly the bit pattern the
+	 * shm header's next field must carry, so no re-pack here */
+	void *child = NULL;
 	if (m->next) {
-		nb = enc(m->next, pi, elt_size, h, &nb_pi);
-		if (!nb) { rte_ub_ring_free_buf(h, buf); return NULL; }
+		child = enc(m->next, pi, elt_size, h);
+		if (!child) { rte_ub_ring_free_buf(h, buf); return NULL; }
 	}
 
 	/*
@@ -149,14 +154,12 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
 	struct rte_mempool *save_pool = m->pool;
 	uint16_t save_buf_len = m->buf_len;
 
-	if (nb) {
+	if (child) {
 		/* pack the child pointer as {pi, element-base offset} so
 		 * dec() can rebuild it. off > 0 always: element 0 is
 		 * reserved, so a packed 0 would be ambiguous with the
 		 * NULL terminator */
-		uint64_t off = ub_ring_buf_off(
-			rte_ub_ring_get_data_buf_area(h, nb_pi), nb);
-		m->next = (struct rte_mbuf *)(uintptr_t)(((uint64_t)nb_pi << 56) | off);
+		m->next = (struct rte_mbuf *)child;
 	} else {
 		/* 0 = no next segment (element 0 reserved, so no clash) */
 		m->next = NULL;
@@ -178,26 +181,31 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
 	m->next = save_next;
 	m->pool = save_pool;
 	m->buf_len = save_buf_len;
-	*pi_out = pi;
-	return buf;
+	/* return the FINAL ring element {pi, offset} — the same 8B
+	 * encoding every ring carries, so the send path enqueues it
+	 * as-is with no second encoding */
+	return ub_ring_elem_pack((uint8_t)pi,
+		ub_ring_buf_off(rte_ub_ring_get_data_buf_area(h, pi), buf));
 }
 
-/* free an ENCODED buffer chain (next = packed {ni, off} or 0) */
+/* free an ENCODED buffer chain: head elem = packed {pi, off}; the
+ * remaining links live in each shm segment's header next field
+ * (packed {pi, off} or 0). Every segment goes back to the SENDER's
+ * per-lcore alloc cache (not the data ring) — a failed burst's
+ * buffers are reused by the next alloc_buf on this lcore. */
 static void
-free_enc_chain(struct rte_ub_ring_handle *h, void *buf)
+free_enc_chain(struct rte_ub_ring_handle *h, void *elem)
 {
-	while (buf) {
+	while (elem) {
+		uint8_t ni = (uint8_t)((uintptr_t)elem >> 56);
+		uint64_t off = (uintptr_t)elem & 0x00FFFFFFFFFFFFFFULL;
+		void *buf = ub_ring_buf_ptr(
+			rte_ub_ring_get_data_buf_area(h, ni), off);
 		struct rte_mbuf *m = buf;
 		uint64_t nv = (uint64_t)(uintptr_t)m->next;
-		void *next = NULL;
-		if (nv) {
-			uint8_t ni = (uint8_t)(nv >> 56);
-			uint64_t off = nv & 0x00FFFFFFFFFFFFFFULL;
-			next = ub_ring_buf_ptr(
-				rte_ub_ring_get_data_buf_area(h, ni), off);
-		}
-		rte_ub_ring_free_buf(h, buf);
-		buf = next;
+		rte_ub_ring_free_elem_cached(h, elem);
+		elem = nv ? ub_ring_elem_pack((uint8_t)(nv >> 56),
+				nv & 0x00FFFFFFFFFFFFFFULL) : NULL;
 	}
 }
 
@@ -301,12 +309,13 @@ static uint16_t eth_rx(void *q, struct rte_mbuf **b, uint16_t nb) {
 static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 	struct ub_ring_eth_queue *rq=q; struct ub_ring_eth_internals *in=rq->internals;
 	struct rte_ub_ring_handle *h=in->ub_ring_h;
-	void *raw[nb]; uint32_t raw_pi[nb]; uint16_t c=0;
+	/* enc() produces the FINAL packed {pi, offset} ring elements —
+	 * the send path enqueues them as-is, no second encoding */
+	void *elems[nb]; uint16_t c=0;
 	for(uint16_t i=0;i<nb;i++){
-		uint32_t pi_used;
-		void*buf=enc(m[i],rq->provider_index,rq->elt_size,h,&pi_used);
-		if(!buf)break;
-		raw[c]=buf; raw_pi[c]=pi_used; c++;
+		void *e=enc(m[i],rq->provider_index,rq->elt_size,h);
+		if(!e)break;
+		elems[c++]=e;
 	}
 	if(!c){
 		UB_RING_ETH_LOSS_ADD("eth_tx_enc", nb, "no free buffer anywhere");
@@ -320,12 +329,12 @@ static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 	 *    local data ring. fail-fast send makes s ∈ {0, c}.
 	 */
 	uint16_t s = rte_ub_ring_is_mpmc_enabled(h)
-		? rte_ub_ring_mp_send_burst_pi(h, rq->queue_id, raw_pi, raw, c)
-		: rte_ub_ring_send_burst_pi(h, rq->queue_id, raw_pi, raw, c);
+		? rte_ub_ring_mp_send_elems(h, rq->queue_id, elems, c)
+		: rte_ub_ring_send_elems(h, rq->queue_id, elems, c);
 	if (s < c)
 		UB_RING_ETH_LOSS_ADD("eth_tx", c - s, "send backpressure (freed to data ring)");
 	for (uint16_t i = s; i < c; i++)
-		free_enc_chain(h, raw[i]);
+		free_enc_chain(h, elems[i]);
 	if (s)
 		UB_RING_ETH_FLOW_N("eth_tx", s);
 	return s; }

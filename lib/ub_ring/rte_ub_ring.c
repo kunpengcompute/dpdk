@@ -107,8 +107,13 @@ static const char *ubs_strerror(int rc)
  * lcore's cache is touched by exactly one thread — no locks needed.
  * The shared MP/MC data ring is accessed only for bulk refills via
  * MC dequeue (CAS), the single cross-thread synchronization point —
- * same pattern as a mempool per-lcore cache */
-#define UB_RING_ALLOC_CACHE_SIZE 512
+ * same pattern as a mempool per-lcore cache.
+ * Capacity is 2x the refill size: a full refill (512) plus one TX
+ * burst's failed returns (≤512 by burst contract) always fit, so the
+ * TX failure path can return elements to the cache without ever
+ * overflowing — no data-ring round trip on backpressure. */
+#define UB_RING_ALLOC_CACHE_SIZE 1024 /* total per-lcore slots */
+#define UB_RING_ALLOC_REFILL      512  /* bulk MC pull per refill */
 struct alloc_cache {
 	uint32_t len;
 	void *offs[UB_RING_ALLOC_CACHE_SIZE];
@@ -138,6 +143,13 @@ struct rte_ub_ring_handle {
 	struct alloc_cache *alloc_caches[UB_RING_MAX_NODES];
 
 	struct rte_ring **rx_rings, **tx_rings, **shadow_tx, **shadow_rx;
+	/* per-queue flush leftovers (user, mpmc only): elements that could
+	 * not enter the remote tx_ring are stashed here — NOT re-enqueued
+	 * to shadow_tx — and retried on the next flush round. Keeps the
+	 * flush lcore from becoming a second MP producer on shadow_tx and
+	 * avoids 512 single-element re-enqueues on a full remote ring */
+	void **tx_stash;
+	uint16_t *tx_stash_len;
 	/* collect pipeline mid ring (user only, SPSC): the fetch thread
 	 * SP-enqueues from the remote return rings, the dispatch thread
 	 * SC-dequeues and routes into the local data rings */
@@ -494,9 +506,11 @@ rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h, uint32_t pi)
 		/* lazy fill: bulk-refill only when this lcore's cache runs
 		 * dry — one MC dequeue per 512 allocations instead of one
 		 * CAS per buffer. Variable burst — an all-or-nothing bulk
-		 * would fail on a partial ring */
+		 * would fail on a partial ring. Refill size (512) stays
+		 * below the cache capacity (1024) so a following TX-failure
+		 * return can never overflow the cache. */
 		uint32_t n = rte_ring_mc_dequeue_burst(h->data_rings[pi],
-			c->offs, UB_RING_ALLOC_CACHE_SIZE, NULL);
+			c->offs, UB_RING_ALLOC_REFILL, NULL);
 		if (n == 0) {
 			UB_RING_LOSS_ADD("alloc_buf_fail", 1, "data ring empty");
 			return NULL;
@@ -571,6 +585,40 @@ rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf)
 	} else {
 		UB_RING_LOG(ERR, "free_buf %p: no return ring (leak!)", buf);
 	}
+}
+
+/* Return a FINAL packed {pi, offset} element to THIS lcore's alloc
+ * cache — no 128B header read, the element already carries pi. Used
+ * by the TX failure path: freshly encoded buffers go straight back to
+ * the sender's cache, so the next alloc_buf reuses them without a
+ * ring round trip. The cache never overflows by design (capacity 1024
+ * > refill 512 + one burst's max failed returns), so nothing is ever
+ * flushed back to the data ring here. */
+void
+rte_ub_ring_free_elem_cached(struct rte_ub_ring_handle *h, void *elem)
+{
+	if (!h || !elem) return;
+	uint32_t pi = ub_ring_elem_get_node(elem);
+	if (!h->data_rings || !h->data_rings[pi] ||
+			!h->alloc_caches || !h->alloc_caches[pi]) {
+		/* no local data ring/cache (e.g. provider role): fall back
+		 * to the header-based free path */
+		void *buf = ub_ring_buf_ptr(
+			rte_ub_ring_get_data_buf_area(h, pi),
+			ub_ring_elem_get_offset(elem));
+		rte_ub_ring_free_buf(h, buf);
+		return;
+	}
+	struct alloc_cache *c = &h->alloc_caches[pi][rte_lcore_id()];
+	if (c->len >= UB_RING_ALLOC_CACHE_SIZE) {
+		/* unreachable by design (see capacity note above) — guard
+		 * kept so an invariant break surfaces loudly instead of
+		 * writing out of bounds */
+		UB_RING_LOG(ERR, "alloc cache overflow pi=%u len=%u",
+			pi, c->len);
+		return;
+	}
+	c->offs[c->len++] = elem;
 }
 
 uint64_t
@@ -659,17 +707,13 @@ uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h, uint32_t q, void *
   if(s<c)UB_RING_LOSS_ADD("send_burst",c-s,"tx_ring full (backpressure)");
   return s; }
 
-uint16_t rte_ub_ring_send_burst_pi(struct rte_ub_ring_handle *h, uint32_t q,
-		const uint32_t *pi, void **b, uint16_t n)
-{ if(!h||q>=h->total_queues||!b||!pi||!n)return 0; void *e[n];uint16_t c=0;
-  /* caller-provided pi; offset by LOCAL pointer arithmetic — the
-   * header lives in remote shm (non-cacheable), never read it on
-   * the hot path */
-  for(uint16_t i=0;i<n;i++){if(!b[i])return 0;
-  e[c++]=ub_ring_elem_pack((uint8_t)pi[i],
-	  ub_ring_buf_off(h->peers[pi[i]].data_buf_area,b[i]));}
-  uint16_t s=(uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,c,NULL);
-  if(s<c)UB_RING_LOSS_ADD("send_burst_pi",c-s,"tx_ring full (backpressure)");
+uint16_t rte_ub_ring_send_elems(struct rte_ub_ring_handle *h, uint32_t q,
+		void **e, uint16_t n)
+{ if(!h||q>=h->total_queues||!e||!n)return 0;
+  /* elements are already in the FINAL packed {pi, offset} form that
+   * enc() produced — enqueue as-is, no re-encoding */
+  uint16_t s=(uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],e,n,NULL);
+  if(s<n)UB_RING_LOSS_ADD("send_elems",n-s,"tx_ring full (backpressure)");
   return s; }
 uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
 { if(!h||q>=h->total_queues||!b||!n)return 0; void *e[n];
@@ -681,7 +725,12 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 	if (!h || h->mpmc_enabled) return -EINVAL;
 	h->shadow_tx = rte_zmalloc(NULL, h->total_queues * sizeof(void*), 0);
 	h->shadow_rx = rte_zmalloc(NULL, h->total_queues * sizeof(void*), 0);
-	if (!h->shadow_tx || !h->shadow_rx) {
+	/* one 512-slot stash per queue for flush_tx leftovers */
+	h->tx_stash = rte_zmalloc(NULL,
+		(size_t)h->total_queues * 512 * sizeof(void*), 0);
+	h->tx_stash_len = rte_zmalloc(NULL,
+		h->total_queues * sizeof(uint16_t), 0);
+	if (!h->shadow_tx || !h->shadow_rx || !h->tx_stash || !h->tx_stash_len) {
 		UB_RING_LOG(ERR, "enable_mpmc: shadow array alloc failed "
 			"(rte_errno=%d %s)", rte_errno, rte_strerror(rte_errno));
 		return -ENOMEM;
@@ -717,70 +766,64 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 	h->mpmc_enabled = true; return 0;
 }
 bool rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h) { return h&&h->mpmc_enabled; }
-/* pack buffers into encoded {pi, offset} elements and enqueue to shadow */
-static uint16_t
-mp_send_pack(struct rte_ub_ring_handle *h, uint32_t q, const uint32_t *pi,
-	     void **b, uint16_t n, bool use_pi)
+/* enqueue FINAL packed {pi, offset} elements to shadow_tx — enc() did
+ * the encoding, so nothing is re-encoded here */
+uint16_t rte_ub_ring_mp_send_elems(struct rte_ub_ring_handle *h, uint32_t q,
+		void **e, uint16_t n)
 {
-	if (!h || !h->mpmc_enabled || q >= h->total_queues || !b || !n)
+	if (!h || !h->mpmc_enabled || q >= h->total_queues || !e || !n)
 		return 0;
 	if (rte_ring_free_count(h->shadow_tx[q]) < n) {
-		UB_RING_LOSS_ADD("mp_send_pack", n, "shadow_tx full (backpressure)");
+		UB_RING_LOSS_ADD("mp_send_elems", n, "shadow_tx full (backpressure)");
 		return 0; /* fail-fast */
 	}
-
-	void *e[n];
-	uint16_t c = 0;
-	for (uint16_t i = 0; i < n; i++) {
-		if (!b[i])
-			return 0;
-		uint32_t ni;
-		if (use_pi)
-			ni = pi[i];
-		else {
-			/* non-pi variant needs the owner from the header —
-			 * cold path in the demo */
-			struct ub_ring_buf_hdr *hd = ub_ring_buf_hdr(b[i]);
-			ni = hd->node_index;
-		}
-		/* offset by LOCAL pointer arithmetic — the header lives in
-		 * remote shm (non-cacheable), never read it on the hot
-		 * path */
-		e[c++] = ub_ring_elem_pack((uint8_t)ni,
-			ub_ring_buf_off(h->peers[ni].data_buf_area, b[i]));
-	}
-	return (uint16_t)rte_ring_enqueue_burst(h->shadow_tx[q], e, c, NULL);
+	return (uint16_t)rte_ring_enqueue_burst(h->shadow_tx[q], e, n, NULL);
 }
-
-uint16_t rte_ub_ring_mp_send_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
-{ return mp_send_pack(h, q, NULL, b, n, false); }
-
-uint16_t rte_ub_ring_mp_send_burst_pi(struct rte_ub_ring_handle *h, uint32_t q,
-		const uint32_t *pi, void **b, uint16_t n)
-{ return mp_send_pack(h, q, pi, b, n, true); }
 uint16_t rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, void **b, uint16_t n)
 { if(!h||!h->mpmc_enabled||q>=h->total_queues)return 0;return (uint16_t)rte_ring_dequeue_burst(h->shadow_rx[q],(void**)b,n,NULL); }
 uint64_t rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 	if (!h || !h->mpmc_enabled || q >= h->total_queues) return 0;
-	/* one burst per call: the flush lcore sweeps every queue once
-	 * per round — same pattern as collect's one-batch-per-ring.
-	 * Bounded work keeps its per-second poll accounting alive */
+	uint64_t moved = 0;
 	void *elems[512];
-	uint16_t n = (uint16_t)rte_ring_dequeue_burst(
-		h->shadow_tx[q], (void**)elems, 512, NULL);
+
+	/* round 1: if the previous round left elements behind (remote ring
+	 * was full), retry the stash first — FIFO, and it keeps the flush
+	 * lcore from ever re-enqueueing to shadow_tx (no second producer
+	 * racing the senders) */
+	if (h->tx_stash_len[q] > 0) {
+		uint16_t s = (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],
+			h->tx_stash[q], h->tx_stash_len[q], NULL);
+		if (s == h->tx_stash_len[q]) {
+			h->tx_stash_len[q] = 0;
+		} else {
+			memmove(h->tx_stash[q], h->tx_stash[q] + s,
+				(size_t)(h->tx_stash_len[q] - s) * sizeof(void *));
+			h->tx_stash_len[q] -= s;
+		}
+		if (s)
+			UB_RING_FLOW_N("flush_tx", s);
+		/* remote ring still backed up — don't pull fresh work from
+		 * the shadow, it could only fill the stash */
+		return moved + s;
+	}
+
+	/* round 2: stash drained, dequeue a fresh batch and push it */
+	uint16_t n = (uint16_t)rte_ring_dequeue_burst(h->shadow_tx[q],
+		(void**)elems, 512, NULL);
 	if (n == 0)
-		return 0;
+		return moved;
 	uint16_t s = (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],
 		elems, n, NULL);
 	if (s < n) {
-		/* real ring full — put unsent back to shadow for retry */
-		for (uint16_t i = s; i < n; i++)
-			if (rte_ring_enqueue_burst(h->shadow_tx[q], &elems[i], 1, NULL) != 1)
-				UB_RING_LOSS_ADD("flush_tx", 1, "shadow refill failed (PERM LOSS)");
+		/* real ring full — hold the unsent tail in the per-queue
+		 * stash and retry it next round (no shadow rollback) */
+		memcpy(h->tx_stash[q], elems + s,
+			(size_t)(n - s) * sizeof(void *));
+		h->tx_stash_len[q] = (uint16_t)(n - s);
 	}
 	if (s)
 		UB_RING_FLOW_N("flush_tx", s);
-	return s;
+	return moved + s;
 }
 
 void rte_ub_ring_flush_tx_all(struct rte_ub_ring_handle *h)
@@ -794,7 +837,8 @@ void rte_ub_ring_flush_tx_all(struct rte_ub_ring_handle *h)
 		uint32_t pending = 0;
 		for (uint32_t q = 0; q < h->total_queues; q++) {
 			rte_ub_ring_flush_tx(h, q);
-			pending += rte_ring_count(h->shadow_tx[q]);
+			pending += rte_ring_count(h->shadow_tx[q]) +
+				h->tx_stash_len[q];
 		}
 		if (pending == 0)
 			return;
@@ -832,6 +876,7 @@ void rte_ub_ring_fini(struct rte_ub_ring_handle *h) {
 	for(uint32_t i=0;i<UB_RING_MAX_NODES;i++)rte_free(h->alloc_caches[i]);
 	if(h->shadow_tx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_tx[q]);rte_free(h->shadow_tx);}
 	if(h->shadow_rx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_rx[q]);rte_free(h->shadow_rx);}
+	rte_free(h->tx_stash); rte_free(h->tx_stash_len);
 	if(h->collect_mid)rte_ring_free(h->collect_mid);
 	ubsmem_destroy_region(h->region_name);ubsmem_finalize();rte_free(h->rx_rings);rte_free(h->tx_rings);rte_free(h);
 }

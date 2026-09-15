@@ -212,6 +212,18 @@ void *rte_ub_ring_alloc_buf(struct rte_ub_ring_handle *h,
 void rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf);
 
 /**
+ * Return a FINAL packed {pi, offset} element to this lcore's alloc
+ * cache (user side). No 128B header read — the element already
+ * carries the owning pi. The cache never overflows by design (1024
+ * slots > 512 refill + one burst's max failed returns), so nothing is
+ * flushed to the data ring. Intended for TX failure paths: freshly
+ * encoded buffers go straight back to the sender's cache, so the next
+ * alloc_buf on this lcore reuses them without a ring round trip.
+ */
+void rte_ub_ring_free_elem_cached(struct rte_ub_ring_handle *h,
+				  void *elem);
+
+/**
  * Return a used buffer (provider side). The element enqueued to the
  * return ring is packed {node_index, offset} read from the buffer's
  * 128B header, and the ring used is the CALLING provider's own return
@@ -282,15 +294,14 @@ uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h,
 				uint32_t queue_id, void **bufs, uint16_t nb);
 
 /**
- * Send burst with explicit per-buffer provider index.
- * Caller knows each buffer's owning pool (from alloc_buf) — avoids
- * the peer scan in the hot path.
+ * Send burst of FINAL packed elements (non-MPMC path).
+ * Elements are already encoded as {node_index, offset} by enc() —
+ * they are enqueued to the real TX ring as-is, no re-encoding.
  *
- * @param pi  array of provider node_index, one per buffer
+ * @param elems  array of packed {node_index, offset} elements
  */
-uint16_t rte_ub_ring_send_burst_pi(struct rte_ub_ring_handle *h,
-				   uint32_t queue_id, const uint32_t *pi,
-				   void **bufs, uint16_t nb);
+uint16_t rte_ub_ring_send_elems(struct rte_ub_ring_handle *h,
+				uint32_t queue_id, void **elems, uint16_t nb);
 
 /**
  * Receive multiple buffers via an RX ring.
@@ -318,17 +329,12 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h);
 bool rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h);
 
 /**
- * MPMC send (multi-producer safe): enqueue to shadow_tx[qid].
+ * MPMC send of FINAL packed elements: enqueue to shadow_tx[qid] as-is.
+ * Elements are already encoded as {node_index, offset} by enc() — no
+ * re-encoding on the hot path.
  */
-uint16_t rte_ub_ring_mp_send_burst(struct rte_ub_ring_handle *h,
-				   uint32_t qid, void **bufs, uint16_t nb);
-
-/**
- * MPMC send with explicit per-buffer provider index (hot-path variant).
- */
-uint16_t rte_ub_ring_mp_send_burst_pi(struct rte_ub_ring_handle *h,
-				      uint32_t qid, const uint32_t *pi,
-				      void **bufs, uint16_t nb);
+uint16_t rte_ub_ring_mp_send_elems(struct rte_ub_ring_handle *h,
+				   uint32_t qid, void **elems, uint16_t nb);
 
 /**
  * MPMC recv (multi-consumer safe): dequeue from shadow_rx[qid].
