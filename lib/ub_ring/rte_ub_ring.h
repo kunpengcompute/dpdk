@@ -198,6 +198,14 @@ uint32_t rte_ub_ring_queue_to_provider(struct rte_ub_ring_handle *h,
 uint32_t rte_ub_ring_get_total_queues(struct rte_ub_ring_handle *h);
 
 /**
+ * Get the total number of data-ring buffers across all providers
+ * (sum of each provider's data ring depth). 0 if no providers ready.
+ * Useful for sizing per-handle pools (e.g. a mempool that must hold
+ * every in-flight buffer at once).
+ */
+uint32_t rte_ub_ring_get_total_bufs(struct rte_ub_ring_handle *h);
+
+/**
  * Allocate a buffer from a provider's local data ring (user only).
  * Returns the app-visible pointer: element base + 128B ownership
  * header (see ub_ring_buf_hdr()).

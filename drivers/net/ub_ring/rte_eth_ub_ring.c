@@ -267,14 +267,18 @@ static uint32_t drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
 	return got;
 }
 
-static struct rte_mempool *mkp(void)
+static struct rte_mempool *mkp(struct rte_ub_ring_handle *h)
 { /* MPSC: put side is MP (each worker's cache overflow flushes into the
    * ring), get side is SC (only the dedicated drain lcore — so the
    * ring backend dequeue is lock-free). cache_size=256 batches the
    * workers' frees so the hot pktmbuf_free path never takes the ring's
    * MP enqueue lock.
-   * 64K objects: more than every in-flight buffer can be freed at once */
-	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",64*1024,0,256,0,NULL,NULL,NULL,NULL,rte_socket_id(),MEMPOOL_F_SC_GET);
+   * depth = 2x the aggregate data-ring depth: more than every
+   * in-flight buffer can be freed at once, with headroom for drain
+   * lcore scheduling lag */
+	uint64_t cap = 2ull * rte_ub_ring_get_total_bufs(h);
+	if (cap > UINT32_MAX) cap = UINT32_MAX;
+	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",(unsigned)cap,0,256,0,NULL,NULL,NULL,NULL,rte_socket_id(),MEMPOOL_F_SC_GET);
 	if (mp) {
 		/* drain all placeholder objects so only freed mbufs are
 		 * ever retrieved. Dequeue straight from the ring (get_bulk
@@ -392,7 +396,7 @@ vdev_probe(struct rte_vdev_device *vdev)
 	struct rte_ub_ring_handle *h = hp;
 	uint32_t nq = rte_ub_ring_get_total_queues(h);
 	struct ub_ring_eth_internals *in = rte_zmalloc_socket(NULL, sizeof(*in), 0, rte_socket_id());
-	if (!in) return -ENOMEM; in->ub_ring_h = h; in->dummy_pool = mkp();
+	if (!in) return -ENOMEM; in->ub_ring_h = h; in->dummy_pool = mkp(h);
 
 	void **rxq = rte_calloc_socket(NULL, nq, sizeof(void *), 0, rte_socket_id());
 	void **txq = rte_calloc_socket(NULL, nq, sizeof(void *), 0, rte_socket_id());

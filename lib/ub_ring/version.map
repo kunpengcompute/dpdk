@@ -16,6 +16,7 @@ DPDK_25 {
 	rte_ub_ring_get_peer_index;
 	rte_ub_ring_get_queue_mapping;
 	rte_ub_ring_get_total_queues;
+	rte_ub_ring_get_total_bufs;
 	rte_ub_ring_provider_init;
 	rte_ub_ring_queue_to_provider;
 	rte_ub_ring_recv_burst;

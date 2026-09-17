@@ -130,6 +130,7 @@ struct rte_ub_ring_handle {
 						   * lcore dequeues */
 		void            *data_buf_area;
 		uint32_t         data_elt_size;
+		uint32_t         data_nb_bufs;   /* data ring depth (mx) of this peer */
 		/* metadata cached locally at init — no shm reads afterwards */
 		uint64_t         total_size;
 		uint32_t         nb_queues;
@@ -182,6 +183,7 @@ init_peer_data_ring(struct rte_ub_ring_handle *h, uint32_t i)
 	struct ub_ring_metadata *m = peer_meta(h, i);
 	if (!m || !(m->state & UB_RING_STATE_DATA_RING_READY)) return;
 	h->peers[i].data_elt_size = m->data_elt_size;
+	h->peers[i].data_nb_bufs = m->data_nb_bufs;
 	h->peers[i].return_ring = (struct rte_ring *)((char *)h->peers[i].shm_base + m->data_ring_offset);
 	size_t rsz = rte_ring_get_memsize(m->data_nb_bufs);
 	/* same 128B alignment as user_init: both sides must agree */
@@ -437,6 +439,7 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 		void*ba=(void*)RTE_ALIGN((uintptr_t)((char*)drb+rrs),128);
 		h->peers[pi].return_ring=rr;
 		h->peers[pi].data_buf_area=ba;
+		h->peers[pi].data_nb_bufs=mx;
 
 		/* create LOCAL data ring
 		 * MP enqueue (collect dispatch, free_buf and TX failure-path
@@ -697,6 +700,8 @@ uint32_t rte_ub_ring_get_data_elt_size(struct rte_ub_ring_handle *h, uint32_t pi
 { if(!h||pi>=UB_RING_MAX_NODES)return 0;return h->peers[pi].data_elt_size; }
 void *rte_ub_ring_get_data_buf_area(struct rte_ub_ring_handle *h, uint32_t pi)
 { if(!h||pi>=UB_RING_MAX_NODES)return NULL;return h->peers[pi].data_buf_area; }
+uint32_t rte_ub_ring_get_total_bufs(struct rte_ub_ring_handle *h)
+{ if(!h)return 0;uint32_t t=0;for(uint32_t i=0;i<UB_RING_MAX_NODES;i++)t+=h->peers[i].data_nb_bufs;return t; }
 
 /* ---- Send / Recv / Flush / Fini ---- */
 uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h, uint32_t q,
@@ -729,13 +734,15 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 		return -ENOMEM;
 	}
 	for (uint32_t q = 0; q < h->total_queues; q++) {
-		/* shadow rings (depth is a fixed spec for now): producers may
-		 * run far ahead of the flusher.
+		/* shadow_tx depth = 2x the owning provider's data ring, so the
+		 * producers can run up to a full buffer pool ahead of the
+		 * flusher. shadow_rx keeps the old fixed depth (spec).
 		 * stx: MP/SC (multiple send-side lcores enqueue, flush lcore
 		 * dequeues)
 		 * srx: SP/MC (flush lcore enqueues, rx-side lcores dequeue) */
+		uint32_t stx_depth = 2u * h->peers[h->queue_to_provider[q]].data_nb_bufs;
 		char n[64]; snprintf(n,64,"stx%u",q);
-		h->shadow_tx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SC_DEQ);
+		h->shadow_tx[q]=rte_ring_create(n,stx_depth,rte_socket_id(),RING_F_SC_DEQ);
 		if (!h->shadow_tx[q]) {
 			UB_RING_LOG(ERR, "enable_mpmc: stx%u create failed "
 				"(rte_errno=%d %s)", q, rte_errno, rte_strerror(rte_errno));
