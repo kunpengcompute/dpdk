@@ -114,6 +114,10 @@ static const char *ubs_strerror(int rc)
  * overflowing — no data-ring round trip on backpressure. */
 #define UB_RING_ALLOC_CACHE_SIZE 1024 /* total per-lcore slots */
 #define UB_RING_ALLOC_REFILL      512  /* bulk MC pull per refill */
+/* flush_tx per-pass batch (shadow_tx dequeue + tx_ring enqueue).
+ * Also the depth of each per-queue tx_stash ring (created in
+ * enable_mpmc) — a full batch's unsent tail is stashed there. */
+#define UB_RING_FLUSH_BURST      1024
 struct alloc_cache {
 	uint32_t len;
 	void *offs[UB_RING_ALLOC_CACHE_SIZE];
@@ -144,13 +148,14 @@ struct rte_ub_ring_handle {
 	struct alloc_cache *alloc_caches[UB_RING_MAX_NODES];
 
 	struct rte_ring **rx_rings, **tx_rings, **shadow_tx, **shadow_rx;
-	/* per-queue flush leftovers (user, mpmc only): elements that could
-	 * not enter the remote tx_ring are stashed here — NOT re-enqueued
-	 * to shadow_tx — and retried on the next flush round. Keeps the
-	 * flush lcore from becoming a second MP producer on shadow_tx and
-	 * avoids 512 single-element re-enqueues on a full remote ring */
-	void **tx_stash;
-	uint16_t *tx_stash_len;
+	/* per-queue flush leftovers (user, mpmc only): one SPSC ring per
+	 * queue — elements that could not enter the remote tx_ring are
+	 * stashed here (NOT re-enqueued to shadow_tx) and retried on the
+	 * next flush round. Keeps the flush lcore from becoming a second MP
+	 * producer on shadow_tx and avoids per-element re-enqueues on a
+	 * full remote ring. Depth = UB_RING_FLUSH_BURST: one full burst's
+	 * unsent tail always fits. */
+	struct rte_ring **tx_stash;
 	/* collect pipeline mid ring (user only, SPSC): the fetch thread
 	 * SP-enqueues from the remote return rings, the dispatch thread
 	 * SC-dequeues and routes into the local data rings */
@@ -727,12 +732,11 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 	if (!h || h->mpmc_enabled) return -EINVAL;
 	h->shadow_tx = rte_zmalloc(NULL, h->total_queues * sizeof(void*), 0);
 	h->shadow_rx = rte_zmalloc(NULL, h->total_queues * sizeof(void*), 0);
-	/* one 512-slot stash per queue for flush_tx leftovers */
+	/* array of per-queue stash rings — each ring is created below
+	 * (one UB_RING_FLUSH_BURST-slot SPSC ring per queue) */
 	h->tx_stash = rte_zmalloc(NULL,
-		(size_t)h->total_queues * 512 * sizeof(void*), 0);
-	h->tx_stash_len = rte_zmalloc(NULL,
-		h->total_queues * sizeof(uint16_t), 0);
-	if (!h->shadow_tx || !h->shadow_rx || !h->tx_stash || !h->tx_stash_len) {
+		h->total_queues * sizeof(struct rte_ring *), 0);
+	if (!h->shadow_tx || !h->shadow_rx || !h->tx_stash) {
 		UB_RING_LOG(ERR, "enable_mpmc: shadow array alloc failed "
 			"(rte_errno=%d %s)", rte_errno, rte_strerror(rte_errno));
 		return -ENOMEM;
@@ -756,6 +760,16 @@ int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h) {
 		h->shadow_rx[q]=rte_ring_create(n,1024*1024,rte_socket_id(),RING_F_SP_ENQ);
 		if (!h->shadow_rx[q]) {
 			UB_RING_LOG(ERR, "enable_mpmc: srx%u create failed "
+				"(rte_errno=%d %s)", q, rte_errno, rte_strerror(rte_errno));
+			return -ENOMEM;
+		}
+		/* per-queue flush stash: SPSC ring, depth = UB_RING_FLUSH_BURST.
+		 * Only the flush lcore touches it (SP enq / SC deq). */
+		snprintf(n,64,"stash%u",q);
+		h->tx_stash[q]=rte_ring_create(n,UB_RING_FLUSH_BURST,rte_socket_id(),
+			RING_F_SP_ENQ|RING_F_SC_DEQ);
+		if (!h->tx_stash[q]) {
+			UB_RING_LOG(ERR, "enable_mpmc: stash%u create failed "
 				"(rte_errno=%d %s)", q, rte_errno, rte_strerror(rte_errno));
 			return -ENOMEM;
 		}
@@ -790,22 +804,25 @@ uint16_t rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h, uint32_t q, voi
 uint64_t rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 	if (!h || !h->mpmc_enabled || q >= h->total_queues) return 0;
 	uint64_t moved = 0;
-	void *elems[512];
+	void *elems[UB_RING_FLUSH_BURST];
+	/* per-queue stash ring (SPSC, depth = UB_RING_FLUSH_BURST):
+	 * only the flush lcore reads and writes it */
+	struct rte_ring *stash = h->tx_stash[q];
 
 	/* round 1: if the previous round left elements behind (remote ring
 	 * was full), retry the stash first — FIFO, and it keeps the flush
 	 * lcore from ever re-enqueueing to shadow_tx (no second producer
 	 * racing the send-side lcores) */
-	if (h->tx_stash_len[q] > 0) {
+	if (rte_ring_count(stash) > 0) {
+		uint16_t n = (uint16_t)rte_ring_dequeue_burst(stash,
+			(void **)elems, UB_RING_FLUSH_BURST, NULL);
 		uint16_t s = (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],
-			h->tx_stash[q], h->tx_stash_len[q], NULL);
-		if (s == h->tx_stash_len[q]) {
-			h->tx_stash_len[q] = 0;
-		} else {
-			memmove(h->tx_stash[q], h->tx_stash[q] + s,
-				(size_t)(h->tx_stash_len[q] - s) * sizeof(void *));
-			h->tx_stash_len[q] -= s;
-		}
+			elems, n, NULL);
+		/* the stash was just drained to empty, so the unsent tail
+		 * (n - s <= n <= UB_RING_FLUSH_BURST) always fits back in —
+		 * the enqueue cannot fail and FIFO order is preserved */
+		if (s < n)
+			rte_ring_enqueue_burst(stash, elems + s, n - s, NULL);
 		if (s)
 			UB_RING_FLOW_N("flush_tx", s);
 		/* remote ring still backed up — don't pull fresh work from
@@ -815,17 +832,17 @@ uint64_t rte_ub_ring_flush_tx(struct rte_ub_ring_handle *h, uint32_t q) {
 
 	/* round 2: stash drained, dequeue a fresh batch and push it */
 	uint16_t n = (uint16_t)rte_ring_dequeue_burst(h->shadow_tx[q],
-		(void**)elems, 512, NULL);
+		(void**)elems, UB_RING_FLUSH_BURST, NULL);
 	if (n == 0)
 		return moved;
 	uint16_t s = (uint16_t)rte_ring_enqueue_burst(h->tx_rings[q],
 		elems, n, NULL);
 	if (s < n) {
 		/* real ring full — hold the unsent tail in the per-queue
-		 * stash and retry it next round (no shadow rollback) */
-		memcpy(h->tx_stash[q], elems + s,
-			(size_t)(n - s) * sizeof(void *));
-		h->tx_stash_len[q] = (uint16_t)(n - s);
+		 * stash and retry it next round (no shadow rollback). The
+		 * stash is empty here (round-2 precondition) and its depth
+		 * UB_RING_FLUSH_BURST >= n - s, so this cannot fail */
+		rte_ring_enqueue_burst(stash, elems + s, n - s, NULL);
 	}
 	if (s)
 		UB_RING_FLOW_N("flush_tx", s);
@@ -844,7 +861,7 @@ void rte_ub_ring_flush_tx_all(struct rte_ub_ring_handle *h)
 		for (uint32_t q = 0; q < h->total_queues; q++) {
 			rte_ub_ring_flush_tx(h, q);
 			pending += rte_ring_count(h->shadow_tx[q]) +
-				h->tx_stash_len[q];
+				rte_ring_count(h->tx_stash[q]);
 		}
 		if (pending == 0)
 			return;
@@ -888,7 +905,7 @@ void rte_ub_ring_fini(struct rte_ub_ring_handle *h) {
 	for(uint32_t i=0;i<UB_RING_MAX_NODES;i++)rte_free(h->alloc_caches[i]);
 	if(h->shadow_tx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_tx[q]);rte_free(h->shadow_tx);}
 	if(h->shadow_rx){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->shadow_rx[q]);rte_free(h->shadow_rx);}
-	rte_free(h->tx_stash); rte_free(h->tx_stash_len);
+	if(h->tx_stash){for(uint32_t q=0;q<h->total_queues;q++)rte_ring_free(h->tx_stash[q]);rte_free(h->tx_stash);}
 	if(h->collect_mid)rte_ring_free(h->collect_mid);
 	ubsmem_destroy_region(h->region_name);ubsmem_finalize();rte_free(h->rx_rings);rte_free(h->tx_rings);rte_free(h);
 }
