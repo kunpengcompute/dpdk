@@ -276,24 +276,53 @@ static struct rte_mempool *mkp(struct rte_ub_ring_handle *h)
    * depth = 2x the aggregate data-ring depth: more than every
    * in-flight buffer can be freed at once, with headroom for drain
    * lcore scheduling lag */
-	uint64_t cap = 2ull * rte_ub_ring_get_total_bufs(h);
+	uint32_t total = rte_ub_ring_get_total_bufs(h);
+	uint64_t cap = 2ull * total;
 	if (cap > UINT32_MAX) cap = UINT32_MAX;
+	UB_RING_ETH_LOG(INFO, "mkp: total data bufs=%u, pool cap=%llu",
+		total, (unsigned long long)cap);
+	if (total == 0) {
+		UB_RING_ETH_LOG(ERR, "mkp: no provider data rings ready — "
+			"cannot size dummy pool (2x data ring); dec() would restore "
+			"a NULL pool and pktmbuf_free would crash");
+		return NULL;
+	}
 	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",(unsigned)cap,0,256,0,NULL,NULL,NULL,NULL,rte_socket_id(),MEMPOOL_F_SC_GET);
-	if (mp) {
+	if (!mp) {
+		UB_RING_ETH_LOG(ERR, "mkp: rte_mempool_create(cap=%llu) failed "
+			"rte_errno=%d (%s)", (unsigned long long)cap,
+			rte_errno, rte_strerror(rte_errno));
+		return NULL;
+	}
+	{
+		unsigned int avail = rte_mempool_avail_count(mp);
+		if (avail != (unsigned int)cap)
+			UB_RING_ETH_LOG(ERR, "mkp: pool created but populated "
+				"partially: avail=%u cap=%llu", avail,
+				(unsigned long long)cap);
 		/* drain all placeholder objects so only freed mbufs are
 		 * ever retrieved. Dequeue straight from the ring (get_bulk
 		 * would refill this lcore's cache with placeholders):
 		 * fixed-size batches, then one-by-one for the tail.
 		 * mempool ops contract: 0 = got n objects, <0 = empty */
 		void *o[64];
+		uint32_t drained = 0;
 		for (;;) {
 			if (rte_mempool_ops_dequeue_bulk(mp, o, 64) < 0)
 				break;
+			drained += 64;
 		}
 		for (;;) {
 			if (rte_mempool_ops_dequeue_bulk(mp, o, 1) < 0)
 				break;
+			drained++;
 		}
+		if (drained != (uint32_t)cap)
+			UB_RING_ETH_LOG(ERR, "mkp: drain incomplete: drained=%u "
+				"cap=%llu", drained, (unsigned long long)cap);
+		UB_RING_ETH_LOG(INFO, "mkp: dummy pool ready (cap=%llu "
+			"drained=%u avail=%u)", (unsigned long long)cap,
+			drained, rte_mempool_avail_count(mp));
 	}
 	return mp; }
 
@@ -397,6 +426,14 @@ vdev_probe(struct rte_vdev_device *vdev)
 	uint32_t nq = rte_ub_ring_get_total_queues(h);
 	struct ub_ring_eth_internals *in = rte_zmalloc_socket(NULL, sizeof(*in), 0, rte_socket_id());
 	if (!in) return -ENOMEM; in->ub_ring_h = h; in->dummy_pool = mkp(h);
+	if (!in->dummy_pool) {
+		UB_RING_ETH_LOG(ERR, "vdev_probe: dummy pool creation failed "
+			"(see mkp log above) — aborting probe; the data path "
+			"cannot run with a NULL pool (dec() would restore a NULL "
+			"m->pool and pktmbuf_free would crash)");
+		rte_free(in);
+		return -ENOMEM;
+	}
 
 	void **rxq = rte_calloc_socket(NULL, nq, sizeof(void *), 0, rte_socket_id());
 	void **txq = rte_calloc_socket(NULL, nq, sizeof(void *), 0, rte_socket_id());
