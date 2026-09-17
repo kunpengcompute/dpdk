@@ -216,9 +216,10 @@ void rte_ub_ring_free_buf(struct rte_ub_ring_handle *h, void *buf);
  * cache (user side). No 128B header read — the element already
  * carries the owning pi. The cache never overflows by design (1024
  * slots > 512 refill + one burst's max failed returns), so nothing is
- * flushed to the data ring. Intended for TX failure paths: freshly
- * encoded buffers go straight back to the sender's cache, so the next
- * alloc_buf on this lcore reuses them without a ring round trip.
+ * flushed to the data ring. Intended for failure paths: freshly
+ * packed elements go straight back to the caller's per-lcore cache,
+ * so the next alloc_buf on this lcore reuses them without a ring
+ * round trip.
  */
 void rte_ub_ring_free_elem_cached(struct rte_ub_ring_handle *h,
 				  void *elem);
@@ -282,38 +283,33 @@ void *rte_ub_ring_get_data_buf_area(struct rte_ub_ring_handle *h,
 				    uint32_t provider_node_index);
 
 /**
- * Send multiple buffers via a TX ring.
- *
- * @param h         handle from init
- * @param queue_id  global TX queue_id
- * @param bufs      array of buffer pointers
- * @param nb        number of buffers to send
- * @return number of buffers actually sent
- */
-uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h,
-				uint32_t queue_id, void **bufs, uint16_t nb);
-
-/**
  * Send burst of FINAL packed elements (non-MPMC path).
- * Elements are already encoded as {node_index, offset} by enc() —
- * they are enqueued to the real TX ring as-is, no re-encoding.
+ * Pairs with rte_ub_ring_recv_burst().
+ * Elements must already be in the final packed {node_index, offset}
+ * form (see ub_ring_elem_pack()) — they are enqueued as-is, no
+ * re-encoding.
  *
  * @param elems  array of packed {node_index, offset} elements
  */
-uint16_t rte_ub_ring_send_elems(struct rte_ub_ring_handle *h,
+uint16_t rte_ub_ring_send_burst(struct rte_ub_ring_handle *h,
 				uint32_t queue_id, void **elems, uint16_t nb);
 
 /**
- * Receive multiple buffers via an RX ring.
+ * Receive multiple ring elements via an RX ring.
+ *
+ * Elements are returned in the raw packed {node_index, offset} form —
+ * rings are pure 8B-value pipes and decoding is the caller's job.
+ * Callers that want buffer pointers must decode with
+ * ub_ring_elem_get_node()/ub_ring_elem_get_offset()/ub_ring_buf_ptr().
  *
  * @param h         handle from init
  * @param queue_id  global RX queue_id
- * @param bufs      [out] array for received buffer pointers
+ * @param elems     [out] array for received packed elements
  * @param nb        maximum number to receive
- * @return number of buffers actually received
+ * @return number of elements actually received
  */
 uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h,
-				uint32_t queue_id, void **bufs, uint16_t nb);
+				uint32_t queue_id, void **elems, uint16_t nb);
 
 /* ================================================================
  *  MPMC support (user side — shadow rings for multi-threaded access)
@@ -322,25 +318,28 @@ uint16_t rte_ub_ring_recv_burst(struct rte_ub_ring_handle *h,
 /**
  * Enable MPMC shadow rings for this handle.
  * Creates local shadow rings per queue:
- *  - shadow_tx: MP/SC — n sender lcores enqueue, flush lcore dequeues
- *  - shadow_rx: SP/MC — flush lcore enqueues, rx lcores dequeue
+ *  - shadow_tx: MP/SC — n send-side lcores enqueue, flush lcore dequeues
+ *  - shadow_rx: SP/MC — flush lcore enqueues, rx-side lcores dequeue
  */
 int rte_ub_ring_enable_mpmc(struct rte_ub_ring_handle *h);
 bool rte_ub_ring_is_mpmc_enabled(struct rte_ub_ring_handle *h);
 
 /**
  * MPMC send of FINAL packed elements: enqueue to shadow_tx[qid] as-is.
- * Elements are already encoded as {node_index, offset} by enc() — no
- * re-encoding on the hot path.
+ * Pairs with rte_ub_ring_mc_recv_burst().
+ * Elements must already be in the final packed {node_index, offset}
+ * form (see ub_ring_elem_pack()) — no re-encoding on the hot path.
  */
-uint16_t rte_ub_ring_mp_send_elems(struct rte_ub_ring_handle *h,
+uint16_t rte_ub_ring_mp_send_burst(struct rte_ub_ring_handle *h,
 				   uint32_t qid, void **elems, uint16_t nb);
 
 /**
  * MPMC recv (multi-consumer safe): dequeue from shadow_rx[qid].
+ * Same raw packed {node_index, offset} element semantics as
+ * rte_ub_ring_recv_burst() — decode with ub_ring_elem_* helpers.
  */
 uint16_t rte_ub_ring_mc_recv_burst(struct rte_ub_ring_handle *h,
-				   uint32_t qid, void **bufs, uint16_t nb);
+				   uint32_t qid, void **elems, uint16_t nb);
 
 /**
  * Flush TX: move all from shadow_tx[qid] → real tx_ring[qid].

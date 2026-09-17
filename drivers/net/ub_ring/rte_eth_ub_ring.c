@@ -72,11 +72,10 @@ RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
 /* ---- temporary perf debug switch -------------------------------
  * UB_RING_ETH_NO_COPY: skip the enc() memcpy (mbuf + payload into
  * shm). The whole alloc → send → recv → return loop still runs, but
- * the server decodes zeroed mbufs (pkt_len = 0). Define it to measure
- * the copy cost on the client TX path; remove the define for normal
- * runs.
+ * the peer decodes zeroed mbufs (pkt_len = 0). Define it to measure
+ * the copy cost on the TX path; remove the define for normal runs.
  */
-#define UB_RING_ETH_NO_COPY
+//#define UB_RING_ETH_NO_COPY
 
 #define UB_RING_ETH_MAX_BURST 128
 
@@ -169,7 +168,7 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
 
 #ifdef UB_RING_ETH_NO_COPY
 	/* DEBUG: copy removed to measure its cost — the shm buffer stays
-	 * zeroed, so the server sees pkt_len = 0 (0 Mbps). refcnt = 1 is
+	 * zeroed, so the peer sees pkt_len = 0 (0 Mbps). refcnt = 1 is
 	 * written so rte_pktmbuf_prefree_seg() takes its return-m path
 	 * (a zero refcnt decrements to 65535 and the mbuf is never put
 	 * back); next stays 0, which now IS the NULL terminator */
@@ -209,8 +208,15 @@ free_enc_chain(struct rte_ub_ring_handle *h, void *elem)
 	}
 }
 
-static struct rte_mbuf *dec(void *buf, struct rte_mempool *dp, struct rte_ub_ring_handle *h, int depth)
+static struct rte_mbuf *dec(void *elem, struct rte_mempool *dp, struct rte_ub_ring_handle *h, int depth)
 {
+	/* decode the ring element: packed {pi, offset} -> data-area pointer.
+	 * enc() produced this encoding; every ring (tx/rx/shadow/return)
+	 * only ever carries the 8B value, so decoding lives here and here
+	 * alone — symmetric with enc() */
+	uint8_t ni = ub_ring_elem_get_node(elem);
+	uint64_t off = ub_ring_elem_get_offset(elem);
+	void *buf = ub_ring_buf_ptr(rte_ub_ring_get_data_buf_area(h, ni), off);
 	struct rte_mbuf *m = buf;
 	uint64_t nv = (uint64_t)(uintptr_t)m->next;
 
@@ -223,11 +229,11 @@ static struct rte_mbuf *dec(void *buf, struct rte_mempool *dp, struct rte_ub_rin
 
 	m->buf_addr = (char *)m + sizeof(struct rte_mbuf) + m->priv_size; m->pool = dp;
 	if (nv) { /* 0 = no next segment (element 0 reserved, no clash) */
-		uint8_t ni = (uint8_t)(nv >> 56); uint64_t off = nv & 0x00FFFFFFFFFFFFFFULL;
-		void *nb = ub_ring_buf_ptr(rte_ub_ring_get_data_buf_area(h, ni), off);
+		uint8_t cni = (uint8_t)(nv >> 56); uint64_t coff = nv & 0x00FFFFFFFFFFFFFFULL;
+		void *nb = ub_ring_buf_ptr(rte_ub_ring_get_data_buf_area(h, cni), coff);
 		if (nb == buf) {
 			UB_RING_ETH_LOG(ERR, "self-referencing next: buf=%p ni=%u off=0x%" PRIx64,
-					buf, ni, off);
+					buf, cni, coff);
 			m->next = NULL;
 			return m;
 		}
@@ -294,13 +300,18 @@ static uint16_t eth_rx(void *q, struct rte_mbuf **b, uint16_t nb) {
 	 * lcore calling rte_eth_ub_ring_drain() — not on the RX path */
 	void *raw[UB_RING_ETH_MAX_BURST];
 	uint16_t n=rte_ub_ring_is_mpmc_enabled(h)?rte_ub_ring_mc_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST)):rte_ub_ring_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST));
-	/* prefetch the next buffer while decoding the current one: the
-	 * header lines are cold (the peer's remote write invalidated them
-	 * last round trip), so one-mbuf look-ahead hides the refill latency */
+	/* raw[] carries PACKED {pi, offset} elements — dec() decodes them.
+	 * Prefetch the NEXT element's data lines while decoding the current
+	 * one: the header lines are cold (the peer's remote write
+	 * invalidated them last round trip), so one-element look-ahead
+	 * hides the refill latency */
 	for(uint16_t i=0;i<n;i++){
 		if (i + 1 < n) {
-			rte_prefetch0(raw[i + 1]);
-			rte_prefetch0((char *)raw[i + 1] + 64);
+			void *nbuf = ub_ring_buf_ptr(
+				rte_ub_ring_get_data_buf_area(h, ub_ring_elem_get_node(raw[i + 1])),
+				ub_ring_elem_get_offset(raw[i + 1]));
+			rte_prefetch0(nbuf);
+			rte_prefetch0((char *)nbuf + 64);
 		}
 		b[i]=dec(raw[i],in->dummy_pool,h,0);
 	}
@@ -329,8 +340,8 @@ static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
 	 *    local data ring. fail-fast send makes s ∈ {0, c}.
 	 */
 	uint16_t s = rte_ub_ring_is_mpmc_enabled(h)
-		? rte_ub_ring_mp_send_elems(h, rq->queue_id, elems, c)
-		: rte_ub_ring_send_elems(h, rq->queue_id, elems, c);
+		? rte_ub_ring_mp_send_burst(h, rq->queue_id, elems, c)
+		: rte_ub_ring_send_burst(h, rq->queue_id, elems, c);
 	if (s < c)
 		UB_RING_ETH_LOSS_ADD("eth_tx", c - s, "send backpressure (freed to data ring)");
 	for (uint16_t i = s; i < c; i++)
