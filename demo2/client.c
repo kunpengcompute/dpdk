@@ -2,11 +2,16 @@
  * Client — N send lcores + 1 flush lcore + collect 2-stage pipeline
  * (fetch + dispatch), continuous TX with per-second rate output on
  * every lcore.
- * Run: ./client --no-huge -l 1-6 --ns=2 --pktlen=500 [--pn=a,b] [--un=c,d] [--time=10]
+ * Run: ./client --no-huge -l 1-6 --ns=2 --pktlen=500 [--f=1] [--pn=a,b] [--un=c,d] [--time=10]
  *      ns     = number of sender lcores (any value vs server queues:
  *               ns <= nq → contiguous queue blocks, RR within block;
  *               ns >  nq → sender s shares queue s % nq)
- *               (needs ns+3 lcores: flush + fetch + dispatch + senders)
+ *      f      = number of flush lcores (default 1). The queues are
+ *               split evenly across the flush threads; each queue has
+ *               EXACTLY ONE flush thread (shadow_tx[q] stays SC_DEQ and
+ *               the shm tx_ring[q] stays SP_ENQ), so the per-queue
+ *               SP/SC contract holds for any f.
+ *               (needs ns+2+f lcores: f×flush + fetch + dispatch + senders)
  *      pktlen = packet payload size (<= RTE_MBUF_DEFAULT_BUF_SIZE - headroom)
  *      time   = run duration in seconds (0 = run until Ctrl+C)
  *      pn/un  = UB provider/user node names: comma-separated list or
@@ -162,25 +167,33 @@ static void log_assign(const char *role, uint32_t q0, uint32_t nq, int all)
 	printf("\n");
 }
 
+/* flush thread assignment: owns queues [q0, q0+nq_own). Each queue is
+ * owned by EXACTLY ONE flush thread — shadow_tx[q] stays SC_DEQ and the
+ * shm tx_ring[q] stays SP_ENQ, so the per-queue SP/SC contract holds
+ * regardless of how many flush threads run (sharing a queue between
+ * flush threads would break it, hence nq_own is never split). */
+struct farg { uint32_t q0, nq_own; };
+
 static int flush_worker(void *arg)
 {
-	(void)arg;
+	struct farg *fa = arg;
 	/* TX flush only: this demo never receives, so rx flush is skipped
 	 * on the hot path (a one-shot final flush_rx still runs at exit) */
-	log_assign("flush", 0, 0, 1);
+	log_assign("flush", fa->q0, fa->nq_own, 0);
 	uint64_t hz = rte_get_tsc_hz(), last = rte_rdtsc();
 	uint64_t loops = 0, work = 0;
 	while (g_running) {
 		uint64_t moved = 0;
-		for (uint32_t q = 0; q < g_nb_q; q++)
-			moved += rte_ub_ring_flush_tx(g_h, q);
+		for (uint32_t i = 0; i < fa->nq_own; i++)
+			moved += rte_ub_ring_flush_tx(g_h, fa->q0 + i);
 		loops++;
 		work += moved > 0;
 
 		uint64_t now = rte_rdtsc();
 		if (now - last >= hz) {
-			printf("[poll flush] loops=%llu work=%llu "
+			printf("[poll flush %u] loops=%llu work=%llu "
 				"idle=%llu busy=%.1f%%\n",
+				rte_lcore_id(),
 				(unsigned long long)loops,
 				(unsigned long long)work,
 				(unsigned long long)(loops - work),
@@ -339,6 +352,8 @@ int main(int argc, char **argv)
 {
 	uint32_t ns = app_opt_uint(&argc, argv, "--ns", 2);
 	if (ns < 1) { fprintf(stderr, "bad --ns\n"); return 1; }
+	uint32_t nf = app_opt_uint(&argc, argv, "--f", 1);
+	if (nf < 1) { fprintf(stderr, "bad --f\n"); return 1; }
 	uint32_t pkt_len = app_opt_uint(&argc, argv, "--pktlen", 500);
 	if (pkt_len < 1 ||
 	    pkt_len > RTE_MBUF_DEFAULT_BUF_SIZE - RTE_PKTMBUF_HEADROOM) {
@@ -360,11 +375,11 @@ int main(int argc, char **argv)
 	unsigned int lc[RTE_MAX_LCORE]; unsigned int nl = 0;
 	for (unsigned int l = 0; l < RTE_MAX_LCORE; l++)
 		if (rte_lcore_is_enabled(l) && l != ml) lc[nl++] = l;
-	if (nl < ns + 3) {
+	if (nl < ns + 2 + nf) {
 		fprintf(stderr,
-			"need %u worker lcores (flush + collect_fetch + "
+			"need %u worker lcores (%u flush + collect_fetch + "
 			"collect_dispatch + %u senders)\n",
-			ns + 3, ns);
+			ns + 2 + nf, nf, ns);
 		return 1;
 	}
 
@@ -389,13 +404,24 @@ int main(int argc, char **argv)
 	char pns[512] = "", uns[512] = "";
 	join_names(pns, sizeof pns, pn, nb_pn);
 	join_names(uns, sizeof uns, un, nb_un);
-	printf("\n===== Client (%u queues, %u sender lcores, %uB pkts, %s, pn=[%s] un=[%s]) =====\n\n",
-		tq, ns, pkt_len, duration ? "timed" : "Ctrl+C to stop", pns, uns);
+	printf("\n===== Client (%u queues, %u sender lcores, %u flush lcores, %uB pkts, %s, pn=[%s] un=[%s]) =====\n\n",
+		tq, ns, nf, pkt_len, duration ? "timed" : "Ctrl+C to stop", pns, uns);
 
 	g_h = h; g_nb_q = tq; g_pn = pn; g_nb_pn = nb_pn;
-	rte_eal_remote_launch(flush_worker, NULL, lc[0]);
-	rte_eal_remote_launch(collect_fetch_worker, NULL, lc[1]);
-	rte_eal_remote_launch(collect_dispatch_worker, NULL, lc[2]);
+
+	/* flush threads: queues split evenly, each queue owned by exactly
+	 * one flush thread (per-queue SP/SC preserved — see farg above).
+	 * More flush threads than queues → the extra ones idle (nq_own=0);
+	 * sharing a queue would break the shm tx ring's SP-enqueue rule */
+	static struct farg fg[RTE_MAX_LCORE];
+	uint32_t fbase = tq / nf, frem = tq % nf;
+	for (uint32_t i = 0; i < nf; i++) {
+		fg[i].q0 = (i < tq) ? i * fbase + RTE_MIN(i, frem) : 0;
+		fg[i].nq_own = (i < tq) ? fbase + (i < frem) : 0;
+		rte_eal_remote_launch(flush_worker, &fg[i], lc[i]);
+	}
+	rte_eal_remote_launch(collect_fetch_worker, NULL, lc[nf]);
+	rte_eal_remote_launch(collect_dispatch_worker, NULL, lc[nf + 1]);
 
 	/* each sender holds BS mbufs for the whole run (TX ownership
 	 * transferred, local mbufs never returned) → pool = ns * BS.
@@ -418,7 +444,7 @@ int main(int argc, char **argv)
 			sa[s].nq_own = base + (s < rem);
 			sa[s].pkt_len = pkt_len;
 			sa[s].mp = mp;
-			rte_eal_remote_launch(sender, &sa[s], lc[3 + s]);
+			rte_eal_remote_launch(sender, &sa[s], lc[nf + 2 + s]);
 		}
 	} else {
 		/* more senders than queues: sender s shares queue s % tq */
@@ -428,7 +454,7 @@ int main(int argc, char **argv)
 			sa[s].nq_own = 1;
 			sa[s].pkt_len = pkt_len;
 			sa[s].mp = mp;
-			rte_eal_remote_launch(sender, &sa[s], lc[3 + s]);
+			rte_eal_remote_launch(sender, &sa[s], lc[nf + 2 + s]);
 		}
 	}
 
@@ -440,15 +466,14 @@ int main(int argc, char **argv)
 		g_running = 0;
 	}
 	for (uint32_t s = 0; s < ns; s++)
-		rte_eal_wait_lcore(lc[3 + s]);
+		rte_eal_wait_lcore(lc[nf + 2 + s]);
 
 	/* stop the flush/collect workers FIRST: shadow rings are SC_DEQ and
 	 * shm rings are SP_ENQ — a concurrent final flush from main would
 	 * corrupt the rings and lose packets */
 	g_running = 0;
-	rte_eal_wait_lcore(lc[0]);
-	rte_eal_wait_lcore(lc[1]);
-	rte_eal_wait_lcore(lc[2]);
+	for (uint32_t i = 0; i < nf + 2; i++)
+		rte_eal_wait_lcore(lc[i]);
 
 	/* final flush alone (bounded: gives up if the peer stopped) */
 	rte_ub_ring_flush_tx_all(g_h);

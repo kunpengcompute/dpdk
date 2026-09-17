@@ -27,7 +27,7 @@ shm 布局：`metadata → 2×nq 个 1M 深收发环 → return 环 → 数据�
 | 资源 | 创建者 | 规格 | flags | 生产者（线程） | 消费者（线程） |
 |---|---|---|---|---|---|
 | 本地 data ring `data_{shm}` | user_init | **mx** 深，每 provider 1 个，元素=打包的 {pi,offset}（与其他环格式统一） | 0（**MP/MC**） | collect 线程 + sender 失败回退 free_buf（多个，MP） | n 个 sender 的 alloc_buf（多个，MC，经 per-lcore cache 批量取） |
-| shadow_tx `stx{q}` | enable_mpmc | 1M 深，每队列 | SC_DEQ（**MP/SC**） | n 个 sender（MP） | flush 线程（SC） |
+| shadow_tx `stx{q}` | enable_mpmc | 1M 深，每队列 | SC_DEQ（**MP/SC**） | n 个 sender（MP） | f 个 flush 线程（每队列唯一，SC） |
 | shadow_rx `srx{q}` | enable_mpmc | 1M 深，每队列 | SP_ENQ（**SP/MC**） | flush 线程（SP） | rx 线程（MC，**demo 未用**） |
 | collect mid 环 `cmid` | enable_mpmc | 1M 深 | SP_ENQ \| SC_DEQ（**SPSC**） | collect_fetch 线程（SP） | collect_dispatch 线程（SC） |
 | tx mempool `tx` | client main | 32×n 个 mbuf，**cache=0** | MP/MC ring backend | —（不回收） | n 个 sender 启动时各取 32 个，持有全程 |
@@ -42,16 +42,18 @@ shm 布局：`metadata → 2×nq 个 1M 深收发环 → return 环 → 数据�
 
 ## 2. 线程模型
 
-### 2.1 client（n senders，需要 n+2 个 lcore）
+### 2.1 client（n senders / f flushes，需要 n+f+2 个 lcore）
 
 | lcore | 线程 | 与 ring / mempool 的交互 |
 |---|---|---|
-| lc[0] | flush_worker | 循环 tq 个队列：shadow_tx[q] SC 出队 → shm tx_ring[q] SP 入队。**demo 无收包，热路径不做 rx flush**（仅退出时一次性 flush_rx） |
-| lc[1] | collect_fetch_worker | 循环：各 provider 的 **远程** return 环 SC 出队（每环一批 512）→ 本地 mid 环 SP 入队——远程 non-cacheable 读集中在此线程 |
-| lc[2] | collect_dispatch_worker | 循环：mid 环 SC 出队（一批 512）→ 按元素内 pi 路由 → 对应本地 data ring MP 入队——纯本地工作 |
-| lc[3+s] | sender s | 启动：tx pool 取 32 个 mbuf；循环：data ring MC 出队（alloc_buf，经 per-lcore cache）→ enc 拷贝进 shm → shadow_tx[q] MP 入队；enc 失败：free_buf MP 入回 data ring |
+| lc[0..f-1] | flush_worker × f | 每个 flush 线程循环自己分到的队列块（每队列**唯一归属**一个 flush 线程，`--f=N` 均分）：shadow_tx[q] SC 出队 → shm tx_ring[q] SP 入队。**demo 无收包，热路径不做 rx flush**（仅退出时一次性 flush_rx） |
+| lc[f] | collect_fetch_worker | 循环：各 provider 的 **远程** return 环 SC 出队（每环一批 512）→ 本地 mid 环 SP 入队——远程 non-cacheable 读集中在此线程 |
+| lc[f+1] | collect_dispatch_worker | 循环：mid 环 SC 出队（一批 512）→ 按元素内 pi 路由 → 对应本地 data ring MP 入队——纯本地工作 |
+| lc[f+2+s] | sender s | 启动：tx pool 取 32 个 mbuf；循环：data ring MC 出队（alloc_buf，经 per-lcore cache）→ enc 拷贝进 shm → shadow_tx[q] MP 入队；enc 失败：free_buf MP 入回 data ring |
 
-队列分配：ns ≤ tq 时连续均分（前 rem 个 sender 多拿一个队列，块内 RR）；ns > tq 时 sender s 共享队列 s % tq。
+队列分配：
+- sender：ns ≤ tq 时连续均分（前 rem 个 sender 多拿一个队列，块内 RR）；ns > tq 时 sender s 共享队列 s % tq。
+- flush：f ≤ tq 时连续均分（前 rem 个 flush 线程多拿一个队列）；f > tq 时多余 flush 线程空转（nq_own=0）——每队列唯一归属，**不共享**（共享会破坏 shm tx_ring 的 SP 入队契约）。
 
 ### 2.2 server（m workers，需要 m+1 个 lcore）
 
@@ -66,7 +68,7 @@ title demo2 线程模型（client n senders / server m workers）
 
 package "Client（n+2 lcores）" {
   component "sender × n" as SND
-  component "flush lcore" as FL
+  component "flush lcore ×f\n（每队列唯一归属）" as FL
   component "collect lcore" as COL
   component "local data ring\nMP/MC, 深度=mx" as LDR
   component "shadow_tx[q]\nMP/SC, 1M" as STX
@@ -160,7 +162,7 @@ DI -> LDR : ⑦ 按元素内 pi 路由 → 对应 data ring MP 入队 → 回到
 | shm rx_ring[q] | SP/SC | server 发端（demo 无） | client flush → shadow_rx | 同上 |
 | return 环 | **SP/SC** | server drain（唯一；eth_close 的收尾 drain 在所有线程 join 后的主核执行，仍串行） | client collect（唯一） | 两端均单线程 |
 | 本地 data ring | MP/MC | collect 线程 + sender 失败回退（多个） | n senders（多个） | 必须 CAS，两侧都多线程 |
-| shadow_tx[q] | MP/SC | n senders（多个） | flush 线程（唯一） | 入队 CAS，出队免锁 |
+| shadow_tx[q] | MP/SC | n senders（多个） | 每队列 1 个 flush 线程（唯一） | 入队 CAS，出队免锁 |
 | shadow_rx[q] | **SP/MC** | flush 线程（唯一） | rx 线程（多个，demo 无） | 入队免锁，出队 CAS |
 | collect mid 环 | **SP/SC** | collect_fetch（唯一） | collect_dispatch（唯一） | 两端均单线程 |
 | dummy mempool ring | **MP put / SC get** | m workers 的 cache 溢出（多个） | drain 线程（唯一） | 入队 CAS，出队免锁 |
