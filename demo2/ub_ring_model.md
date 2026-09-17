@@ -18,7 +18,7 @@ shm 布局：`metadata → 2×nq 个 1M 深收发环 → return 环 → 数据�
 | return 环 `ret_{shm}` | **user_init**（写入 server shm） | **mx** 深，每 provider 1 个，元素=打包的 {pi,offset} | SP_ENQ \| SC_DEQ（**SPSC**） | 执行归还动作的 provider 的 drain 线程（SP） | client collect 线程（SC） |
 | data buffer 区 | **user_init**（布局） | **mx** 个元素 × elt=2304B | —（裸缓冲区，非环） | — | — |
 
-- `elt = RTE_ALIGN(128, sizeof(rte_mbuf) + RTE_MBUF_DEFAULT_BUF_SIZE + 128)` = 2304B：每元素前 128B 是归属头（{node_index, offset, elt_size, magic}，user_init 时一次性写入、之后只读），mbuf 位于元素基址 +128 处；每个 buffer 128B 对齐
+- `elt = RTE_ALIGN(128, sizeof(rte_mbuf) + RTE_MBUF_DEFAULT_BUF_SIZE + 128)` = 2304B：每元素前 128B 是归属头（64 位位域 `node_index:8 | offset:56` + elt_size + magic，与环元素编码 {pi<<56|offset} 经 pack/get 互转；user_init 时一次性写入、之后只读），mbuf 位于元素基址 +128 处；每个 buffer 128B 对齐
 - `mx = align32prevpow2((shm 剩余空间 - ring 结构 - 128) / (8 + elt))`，4G/nq=4 时约 **1M**；本地 data ring 深度 = return 环深度 = 数据区元素数 = mx
 - 同一物理 shm 环双方视角相反：前半区 client 叫 **tx_ring**（server 叫 rx_ring，demo 流量方向）；后半区 client 叫 rx_ring（server 叫 tx_ring，**demo 未用**）
 
@@ -175,4 +175,4 @@ DI -> LDR : ⑦ 按元素内 pi 路由 → 对应 data ring MP 入队 → 回到
 3. **return 环 SPSC 契约**：入队必须全部来自 drain lcore；`free_buf` 的 provider 分支同样 SP 入队，若 server 侧 TX 失败回退与 drain 并发会破坏契约——demo 中 server 从不 TX。
 4. **shadow_rx SPMC**：flush 线程是唯一生产端；demo 无收包流量，flush 线程热路径已去掉 rx flush，仅退出时执行一次 flush_rx。
 5. **dummy pool 的 cache 只缓冲 free 方向**：drain 线程出队绕开自己核的 cache 直取 ring——否则 get_bulk 回填会把最多 256 个对象残留在 drain 核的 cache 里永远不归还。
-6. **归属判断 O(1)（128B 头）**：每个 buffer 前 128B 头在 user_init 时一次性写入归属 {node_index, offset}，mbuf 位于 +128 处；归还/释放时回退 128B 读头即得 {pi, off}，无需任何节点扫描（find_peer_by_buf 已删除，拆分后单核归还吞吐的扫描瓶颈随之消失）。return 环元素与 tx/rx 环一样打包 {pi<<56\|off}，且归还动作统一走**执行方自己的 return 环**（与 buffer 归属无关），collect 按元素内 pi 放回对应 data ring。
+6. **归属判断 O(1)（128B 头）**：每个 buffer 前 128B 头在 user_init 时一次性写入归属（64 位位域 node_index:8\|offset:56，offset 需 64 位容量——16G shm 下元素偏移可达 9.4G，uint32_t 会截断），mbuf 位于 +128 处；归还/释放时回退 128B 读头即得 {pi, off}（经 ub_ring_elem_pack 转元素编码），无需任何节点扫描（find_peer_by_buf 已删除，拆分后单核归还吞吐的扫描瓶颈随之消失）。return 环元素与 tx/rx 环一样打包 {pi<<56\|off}，且归还动作统一走**执行方自己的 return 环**（与 buffer 归属无关），collect 按元素内 pi 放回对应 data ring。

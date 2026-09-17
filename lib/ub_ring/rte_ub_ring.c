@@ -468,10 +468,14 @@ rte_ub_ring_user_init(const char **pn, uint32_t np, const char **un, uint32_t nu
 			for(uint32_t k=0;k<n;k++){
 				struct ub_ring_buf_hdr *hd=(struct ub_ring_buf_hdr*)((char*)ba+(size_t)(idx+k)*elt);
 				hd->node_index=pi;
-				hd->offset=(uint32_t)((idx+k)*elt);
+				/* 64-bit multiply first: (idx+k)*elt can exceed 32 bits
+				 * (16G shm / elt=2304 → max offset ≈ 9.4G), a uint32
+				 * product wraps before the (uint64_t) cast */
+				hd->offset=(uint64_t)(idx+k)*(uint64_t)elt;
 				hd->elt_size=elt;
 				hd->magic=UB_RING_BUF_MAGIC;
-				e[k]=ub_ring_elem_pack((uint8_t)pi,(idx+k)*elt);
+				e[k]=ub_ring_elem_pack((uint8_t)pi,
+					(uint64_t)(idx+k)*(uint64_t)elt);
 			}
 			rte_ring_enqueue_burst(h->data_rings[pi],e,n,NULL);}
 

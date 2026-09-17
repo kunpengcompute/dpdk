@@ -58,12 +58,16 @@ struct ub_ring_metadata {
 #define UB_RING_BUF_HDR_SIZE 128
 #define UB_RING_BUF_MAGIC   0x55425248ULL /* "UBRH" */
 
-/* written once by user_init, read-only afterwards */
+/* written once by user_init, read-only afterwards. Ownership is stored
+ * as one 64-bit bitfield: node_index:8 | offset:56 (little-endian
+ * bitfield layout: node_index in the low 8 bits, offset in the high
+ * 56). Converted to/from the ring element encoding {pi<<56 | offset}
+ * (pi in the high byte) with ub_ring_elem_pack()/ub_ring_elem_get_*() */
 struct ub_ring_buf_hdr {
-	uint32_t node_index; /* owning provider node index */
-	uint32_t offset;     /* element offset from data_buf_area (bytes) */
-	uint32_t elt_size;   /* element stride in bytes (sanity check) */
-	uint32_t magic;      /* UB_RING_BUF_MAGIC */
+	uint64_t node_index : 8;  /* owning provider node index */
+	uint64_t offset     : 56; /* element offset from data_buf_area (bytes) */
+	uint32_t elt_size;        /* element stride in bytes (sanity check) */
+	uint32_t magic;           /* UB_RING_BUF_MAGIC */
 };
 
 /* The app-visible buffer pointer sits UB_RING_BUF_HDR_SIZE past the

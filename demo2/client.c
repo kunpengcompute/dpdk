@@ -6,8 +6,8 @@
  *      ns     = number of sender lcores (any value vs server queues:
  *               ns <= nq → contiguous queue blocks, RR within block;
  *               ns >  nq → sender s shares queue s % nq)
- *      f      = number of flush lcores (default 1). The queues are
- *               split evenly across the flush threads; each queue has
+ *      f      = number of flush lcores (default 1; --f=2 or -f=2). The
+ *               queues are split evenly across the flush threads; each queue has
  *               EXACTLY ONE flush thread (shadow_tx[q] stays SC_DEQ and
  *               the shm tx_ring[q] stays SP_ENQ), so the per-queue
  *               SP/SC contract holds for any f.
@@ -46,22 +46,28 @@ static void on_sigint(int sig)
 	g_running = 0;
 }
 
-/* parse "--opt=N" BEFORE eal_init and strip it from argv, so EAL's
- * getopt never sees it (would fail with "unrecognized option") */
+/* parse "--opt=N" (and "-opt=N") BEFORE eal_init and strip it from argv,
+ * so EAL's getopt never sees it — EAL rejects unknown single-dash
+ * options ("invalid option -- 'f'") before it even reaches the app */
 static uint32_t app_opt_uint(int *argc, char **argv, const char *opt,
 			     uint32_t def)
 {
+	const char *name = opt + 2;	/* "--f" -> "f" */
+	size_t nl = strlen(name);
 	for (int i = 1; i < *argc; i++) {
-		size_t l = strlen(opt);
-		if (strncmp(argv[i], opt, l) == 0 && argv[i][l] == '=') {
-			char *end = NULL;
-			unsigned long v = strtoul(argv[i] + l + 1, &end, 0);
-			for (int j = i; j < *argc - 1; j++)
-				argv[j] = argv[j + 1];
-			(*argc)--;
-			if (end && *end == '\0')
-				return (uint32_t)v;
-		}
+		const char *p = argv[i];
+		if (p[0] != '-' || p[1] == '\0')
+			continue;
+		const char *v = p + ((p[1] == '-') ? 2 : 1);
+		if (strncmp(v, name, nl) != 0 || v[nl] != '=')
+			continue;
+		char *end = NULL;
+		unsigned long val = strtoul(v + nl + 1, &end, 0);
+		for (int j = i; j < *argc - 1; j++)
+			argv[j] = argv[j + 1];
+		(*argc)--;
+		if (end && *end == '\0')
+			return (uint32_t)val;
 	}
 	return def;
 }
