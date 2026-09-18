@@ -7,7 +7,7 @@
 #    - DPDK meson:        --buildtype=debug   (= -O0 -g; also auto-enables
 #                         UB_RING_FLOW_TRACE flow tracing in
 #                         drivers/net/ub_ring/meson.build)
-#    - demo2 cmake:       -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS_DEBUG="-g -O0"
+#    - demo2/demo3 cmake: -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS_DEBUG="-g -O0"
 #
 #  Note: release and debug use SEPARATE build dirs (build-release /
 #  build-debug), so you can switch freely; both install into the same
@@ -24,6 +24,7 @@ PREFIX="${PREFIX:-$SRC_DIR/install}"          # non-system install prefix
 BUILD_TYPE="debug"
 BUILD_DIR="${BUILD_DIR:-$SRC_DIR/build-debug}"        # DPDK meson build dir
 DEMO_BUILD_DIR="$SRC_DIR/demo2/build-debug"           # demo2 cmake build dir
+DEMO3_BUILD_DIR="$SRC_DIR/demo3/build-debug"          # demo3 cmake build dir
 JOBS="$(nproc)"
 LIBDIR="lib"                                  # deterministic layout: $PREFIX/lib
 
@@ -70,19 +71,24 @@ PMD_FILE="$(ls "$PREFIX/$LIBDIR/dpdk"/pmds-*/librte_net_ub_ring.so* 2>/dev/null 
 PMD_DIR="$(dirname "$PMD_FILE")"
 say "    PMD installed: $PMD_DIR"
 
-# ------------------------------------------------ [4/5] build demo2 ---------
-say "==> [4/5] cmake build demo2 (Debug, -g -O0; fresh build dir)"
-rm -rf "$DEMO_BUILD_DIR"
+# ------------------------------------------------ [4/5] build demos ---------
+say "==> [4/5] cmake build demo2 + demo3 (Debug, -g -O0; fresh build dirs)"
+rm -rf "$DEMO_BUILD_DIR" "$DEMO3_BUILD_DIR"
 cmake -S "$SRC_DIR/demo2" -B "$DEMO_BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS_DEBUG="-g -O0"
 cmake --build "$DEMO_BUILD_DIR" -j"$JOBS"
+cmake -S "$SRC_DIR/demo3" -B "$DEMO3_BUILD_DIR" \
+    -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS_DEBUG="-g -O0"
+cmake --build "$DEMO3_BUILD_DIR" -j"$JOBS"
 
 # ------------------------------------------------ [5/5] verify linkage ------
 say "==> [5/5] verify demo2 links OUR DPDK (24.11.7-rc1), not the system one (23.11)"
 PKGCONF_VER="$(pkg-config --modversion libdpdk)"
 say "    pkg-config libdpdk = $PKGCONF_VER   (system RPM is 23.11)"
-echo "    --- ldd (librte/ubsm lines) ---"
+echo "    --- ldd (librte/ubsm lines): demo2 client ---"
 ldd "$DEMO_BUILD_DIR/client" | grep -E 'librte|ubsm' || true
+echo "    --- ldd (librte/ubsm lines): demo3 client (no rte_net_ub_ring expected) ---"
+ldd "$DEMO3_BUILD_DIR/client" | grep -E 'librte|ubsm' || true
 echo "    --- RPATH/RUNPATH ---"
 readelf -d "$DEMO_BUILD_DIR/client" | grep -E 'RPATH|RUNPATH' || true
 
@@ -91,11 +97,13 @@ printf '%s\n' \
     "Build OK.  ($BUILD_TYPE: -O0 -g, UB_RING_FLOW_TRACE on)" \
     "  DPDK prefix   : $PREFIX   (system DPDK 23.11 in /usr/lib64 untouched)" \
     "  demo2 binaries: $DEMO_BUILD_DIR/client  $DEMO_BUILD_DIR/server" \
+    "  demo3 binaries: $DEMO3_BUILD_DIR/client  $DEMO3_BUILD_DIR/server  (ring index only, no mbuf/PMD)" \
     "" \
     "Run (as root; UB devices already loaded, no hugepages needed):" \
-    "  cd $DEMO_BUILD_DIR" \
-    "  ./server --no-huge -l 1-6 --nq=4 [--pn=master] [--un=worker1] [--time=10]" \
-    "  ./client --no-huge -l 1-6 --ns=2 --pktlen=500 [--pn=master] [--un=worker1] [--time=10]" \
+    "  demo2: cd $DEMO_BUILD_DIR; ./server --no-huge -l 1-6 --nq=4 [--pn=master] [--un=worker1] [--time=10]" \
+    "         ./client --no-huge -l 1-6 --ns=2 --pktlen=500 [--pn=master] [--un=worker1] [--time=10]" \
+    "  demo3: cd $DEMO3_BUILD_DIR; ./server --no-huge -l 1-6 --nq=4 [--pn=master] [--un=worker1] [--time=10]" \
+    "         ./client --no-huge -l 1-6 --ns=2 --elt=128 [--pn=master] [--un=worker1] [--time=10]" \
     "" \
     "Debug (break e.g. vdev_probe_all_drivers / rte_eth_ub_ring_attach):" \
     "  gdb --args $DEMO_BUILD_DIR/server --no-huge -l 1-6 --nq=4 --pn=master --un=worker1 --time=5" \
@@ -103,5 +111,5 @@ printf '%s\n' \
     "  (gdb) break vdev_probe_all_drivers" \
     "  (gdb) run" \
     "" \
-    "client/server carry an RPATH to $PREFIX, so they resolve librte_*.so.25 /" \
-    "librte_net_ub_ring.so from $PREFIX and never from /usr/lib64."
+    "client/server carry an RPATH to $PREFIX, so they resolve librte_*.so.25 from" \
+    "$PREFIX (demo2 additionally pulls librte_net_ub_ring.so) and never from /usr/lib64."

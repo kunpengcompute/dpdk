@@ -5,9 +5,10 @@
 #   1) builds  DPDK 24.11.7-rc1 (with lib/ub_ring + drivers/net/ub_ring)
 #   2) installs DPDK into a NON-SYSTEM prefix  (default: <repo>/install)
 #      -> the system DPDK 23.11 in /usr/lib64 is left untouched
-#   3) builds  demo2 (client + server) against OUR libs
-#      -> pkg-config + RPATH make demo2 load librte_*.so.25 and
-#         librte_net_ub_ring.so from $PREFIX, never /usr/lib64
+#   3) builds  demo2 + demo3 (client + server) against OUR libs
+#      -> pkg-config + RPATH make demo2/demo3 load librte_*.so.25 from
+#         $PREFIX, never /usr/lib64 (demo2 also loads librte_net_ub_ring
+#         via its PMD; demo3 does not use the PMD at all)
 #
 #  Prereqs (install once; the server has NO internet):
 #    meson >= 1.1, ninja, cmake, gcc, pkg-config, python3 + pyelftools
@@ -27,6 +28,7 @@ PREFIX="${PREFIX:-$SRC_DIR/install}"          # non-system install prefix
 BUILD_TYPE="release"
 BUILD_DIR="${BUILD_DIR:-$SRC_DIR/build-release}"      # DPDK meson build dir
 DEMO_BUILD_DIR="$SRC_DIR/demo2/build-release"         # demo2 cmake build dir
+DEMO3_BUILD_DIR="$SRC_DIR/demo3/build-release"        # demo3 cmake build dir
 JOBS="$(nproc)"
 LIBDIR="lib"                                  # deterministic layout: $PREFIX/lib
 
@@ -73,18 +75,22 @@ PMD_FILE="$(ls "$PREFIX/$LIBDIR/dpdk"/pmds-*/librte_net_ub_ring.so* 2>/dev/null 
 PMD_DIR="$(dirname "$PMD_FILE")"
 say "    PMD installed: $PMD_DIR"
 
-# ------------------------------------------------ [4/5] build demo2 ---------
-say "==> [4/5] cmake build demo2 (fresh build dir, avoids stale pkg-config cache)"
-rm -rf "$DEMO_BUILD_DIR"
+# ------------------------------------------------ [4/5] build demos ---------
+say "==> [4/5] cmake build demo2 + demo3 (fresh build dirs, avoids stale pkg-config cache)"
+rm -rf "$DEMO_BUILD_DIR" "$DEMO3_BUILD_DIR"
 cmake -S "$SRC_DIR/demo2" -B "$DEMO_BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$DEMO_BUILD_DIR" -j"$JOBS"
+cmake -S "$SRC_DIR/demo3" -B "$DEMO3_BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$DEMO3_BUILD_DIR" -j"$JOBS"
 
 # ------------------------------------------------ [5/5] verify linkage ------
 say "==> [5/5] verify demo2 links OUR DPDK (24.11.7-rc1), not the system one (23.11)"
 PKGCONF_VER="$(pkg-config --modversion libdpdk)"
 say "    pkg-config libdpdk = $PKGCONF_VER   (system RPM is 23.11)"
-echo "    --- ldd (librte/ubsm lines) ---"
+echo "    --- ldd (librte/ubsm lines): demo2 client ---"
 ldd "$DEMO_BUILD_DIR/client" | grep -E 'librte|ubsm' || true
+echo "    --- ldd (librte/ubsm lines): demo3 client (no rte_net_ub_ring expected) ---"
+ldd "$DEMO3_BUILD_DIR/client" | grep -E 'librte|ubsm' || true
 echo "    --- RPATH/RUNPATH ---"
 readelf -d "$DEMO_BUILD_DIR/client" | grep -E 'RPATH|RUNPATH' || true
 
@@ -93,11 +99,13 @@ printf '%s\n' \
     "Build OK.  ($BUILD_TYPE)" \
     "  DPDK prefix   : $PREFIX   (system DPDK 23.11 in /usr/lib64 untouched)" \
     "  demo2 binaries: $DEMO_BUILD_DIR/client  $DEMO_BUILD_DIR/server" \
+    "  demo3 binaries: $DEMO3_BUILD_DIR/client  $DEMO3_BUILD_DIR/server  (ring index only, no mbuf/PMD)" \
     "" \
     "Run (as root; UB devices already loaded, no hugepages needed):" \
-    "  cd $DEMO_BUILD_DIR" \
-    "  ./server --no-huge -l 1-6 --nq=4 [--pn=master] [--un=worker1] [--time=10]" \
-    "  ./client --no-huge -l 1-6 --ns=2 --pktlen=500 [--pn=master] [--un=worker1] [--time=10]" \
+    "  demo2: cd $DEMO_BUILD_DIR; ./server --no-huge -l 1-6 --nq=4 [--pn=master] [--un=worker1] [--time=10]" \
+    "         ./client --no-huge -l 1-6 --ns=2 --pktlen=500 [--pn=master] [--un=worker1] [--time=10]" \
+    "  demo3: cd $DEMO3_BUILD_DIR; ./server --no-huge -l 1-6 --nq=4 [--pn=master] [--un=worker1] [--time=10]" \
+    "         ./client --no-huge -l 1-6 --ns=2 --elt=128 [--pn=master] [--un=worker1] [--time=10]" \
     "" \
-    "client/server carry an RPATH to $PREFIX, so they resolve librte_*.so.25 /" \
-    "librte_net_ub_ring.so from $PREFIX and never from /usr/lib64."
+    "client/server carry an RPATH to $PREFIX, so they resolve librte_*.so.25 from" \
+    "$PREFIX (demo2 additionally pulls librte_net_ub_ring.so) and never from /usr/lib64."
