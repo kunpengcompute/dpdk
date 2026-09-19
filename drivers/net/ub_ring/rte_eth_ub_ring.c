@@ -95,6 +95,29 @@ struct ub_ring_eth_internals {
 	struct rte_ether_addr address;
 };
 
+static inline void
+enc_copy64(void *dst, const void *src, uint32_t nb)
+{
+    uint64_t *d = dst;
+    const uint64_t *s = src;
+    uint32_t n = nb >> 3;
+
+    // 每次 64 字节：8 个 uint64_t
+    while (n >= 8) {
+	asm volatile(
+		"ldp q0, q1, [%0], #32\n"
+		"ldp q2, q3, [%0], #32\n"
+		"stp q0, q1, [%1], #32\n"
+		"stp q2, q3, [%1], #32\n"
+		: "+r"(s), "+r"(d)
+		:
+		: "q0", "q1", "q2", "q3", "memory"
+	);
+        n -= 8;
+    }
+}
+
+
 static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
 		 struct rte_ub_ring_handle *h)
 {
@@ -174,7 +197,7 @@ static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
 	 * back); next stays 0, which now IS the NULL terminator */
 	((struct rte_mbuf *)buf)->refcnt = 1;
 #else
-	memcpy(buf, m, need);
+	enc_copy64(buf, m, need);
 #endif
 
 	m->next = save_next;
