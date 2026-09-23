@@ -1,0 +1,8 @@
+INTERNAL {
+	global:
+
+	rte_ifpga_driver_register;
+	rte_ifpga_driver_unregister;
+
+	local: *;
+};
