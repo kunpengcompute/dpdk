@@ -27,6 +27,7 @@ libraries = [
         'metrics', # bitrate/latency stats depends on this
         'hash',    # efd depends on this
         'timer',   # eventdev depends on this
+        'ub_ring', # depends on ring, mempool, mbuf + ubsmem
         'acl',
         'bbdev',
         'bitratestats',

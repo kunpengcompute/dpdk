@@ -1,0 +1,541 @@
+/* SPDX-License-Identifier: BSD-3-Clause
+ *
+ * ub_ring ethdev PMD — follows rte_eth_from_rings() vdev pattern.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+
+#include <rte_eal.h>
+#include <rte_log.h>
+#include <rte_malloc.h>
+#include <rte_errno.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
+#include <rte_ring.h>
+#include <rte_kvargs.h>
+#include <rte_cycles.h>
+#include <rte_ethdev.h>
+#include <bus_vdev_driver.h>
+#include <ethdev_driver.h>
+
+#include <rte_ub_ring.h>
+#include <rte_eth_ub_ring.h>
+
+RTE_LOG_REGISTER_DEFAULT(ub_ring_eth_logtype, INFO);
+#define RTE_LOGTYPE_UB_RING_ETH ub_ring_eth_logtype
+#define UB_RING_ETH_LOG(level, ...) \
+	RTE_LOG_LINE_PREFIX(level, UB_RING_ETH, "%s(): ", __func__, __VA_ARGS__)
+
+/* flow-trace helpers: at most one line per second.
+ * Only compiled in when -DUB_RING_FLOW_TRACE is set (debug builds —
+ * see drivers/net/ub_ring/meson.build); expands to nothing otherwise. */
+#ifdef UB_RING_FLOW_TRACE
+#define UB_RING_ETH_FLOW_N(site, n) do { \
+	static uint64_t cnt, prev, last; \
+	uint64_t now = rte_rdtsc(); \
+	cnt += (n); \
+	if (now - last >= rte_get_tsc_hz()) { \
+		UB_RING_ETH_LOG(INFO, "[flow] %s: total=%" PRIu64 \
+			" (+%" PRIu64 " pkts/s)", site, cnt, cnt - prev); \
+		prev = cnt; \
+		last = now; \
+	} \
+} while (0)
+
+#define UB_RING_ETH_FLOW_WARN(fmt, ...) do { \
+	static uint64_t last; \
+	uint64_t now = rte_rdtsc(); \
+	if (now - last >= rte_get_tsc_hz()) { \
+		last = now; \
+		UB_RING_ETH_LOG(WARNING, "[flow] " fmt, ##__VA_ARGS__); \
+	} \
+} while (0)
+#else
+#define UB_RING_ETH_FLOW_N(site, n) do { } while (0)
+#define UB_RING_ETH_FLOW_WARN(fmt, ...) do { } while (0)
+#endif
+
+/* loss counters: ALWAYS compiled (independent of UB_RING_FLOW_TRACE) */
+#define UB_RING_ETH_LOSS_ADD(site, n, why) do { \
+	static uint64_t cnt, prev, last; \
+	uint64_t now = rte_rdtsc(); \
+	cnt += (n); \
+	if (now - last >= rte_get_tsc_hz()) { \
+		UB_RING_ETH_LOG(ERR, "[loss] %s: +%" PRIu64 \
+			" pkts/s dropped (%s)", site, cnt - prev, why); \
+		prev = cnt; \
+		last = now; \
+	} \
+} while (0)
+
+/* ---- temporary perf debug switch -------------------------------
+ * UB_RING_ETH_NO_COPY: skip the enc() memcpy (mbuf + payload into
+ * shm). The whole alloc → send → recv → return loop still runs, but
+ * the peer decodes zeroed mbufs (pkt_len = 0). Define it to measure
+ * the copy cost on the TX path; remove the define for normal runs.
+ */
+//#define UB_RING_ETH_NO_COPY
+
+#define UB_RING_ETH_MAX_BURST 128
+
+struct ub_ring_eth_internals;
+struct ub_ring_eth_queue {
+	uint32_t queue_id, provider_index;
+	/* cached at setup: the element size is user-defined and
+	 * identical across providers — no per-packet lookup */
+	uint32_t elt_size;
+	struct ub_ring_eth_internals *internals;
+};
+struct ub_ring_eth_internals {
+	struct ub_ring_eth_queue rx_queues[RTE_MAX_QUEUES_PER_PORT];
+	struct ub_ring_eth_queue tx_queues[RTE_MAX_QUEUES_PER_PORT];
+	struct rte_ub_ring_handle *ub_ring_h;
+	struct rte_mempool *dummy_pool;
+	struct rte_ether_addr address;
+};
+
+static inline void
+enc_copy64(void *dst, const void *src, uint32_t nb)
+{
+    uint64_t *d = dst;
+    const uint64_t *s = src;
+    uint32_t n = nb >> 3;
+
+    // 每次 64 字节：8 个 uint64_t
+    while (n >= 8) {
+	asm volatile(
+		"ldp q0, q1, [%0], #32\n"
+		"ldp q2, q3, [%0], #32\n"
+		"stp q0, q1, [%1], #32\n"
+		"stp q2, q3, [%1], #32\n"
+		: "+r"(s), "+r"(d)
+		:
+		: "q0", "q1", "q2", "q3", "memory"
+	);
+        n -= 8;
+    }
+}
+
+
+static void *enc(struct rte_mbuf *m, uint32_t pi_pref, uint32_t elt_size,
+		 struct rte_ub_ring_handle *h)
+{
+	/* copy only header + priv + headroom + data (no tailroom), rounded
+	 * UP to 64B: the shm buffers sit in a NONCACHE region, so a
+	 * partial cacheline tail would trigger an extra remote
+	 * transaction on the fabric. The capacity check below uses the
+	 * same aligned size so the copy never crosses into the next
+	 * element */
+	uint32_t need = RTE_ALIGN_CEIL(sizeof(struct rte_mbuf) +
+			m->priv_size + m->data_off + m->data_len, 64);
+
+	/*
+	 * Try the target provider's data ring first; if exhausted, fall
+	 * back to any other node's data ring. The chosen provider index
+	 * is packed into the returned element.
+	 *
+	 * elt_size is cached at queue setup — the element size is
+	 * user-defined and identical across all providers, so the hot
+	 * path never looks it up.
+	 */
+	uint32_t pi = pi_pref;
+	void *buf = NULL;
+	if (elt_size >= need)
+		buf = rte_ub_ring_alloc_buf(h, pi);
+	if (!buf) {
+		for (uint32_t c = 0; c < UB_RING_MAX_NODES; c++) {
+			uint32_t esz;
+			if (c == pi_pref)
+				continue;
+			/* cold path: skip nodes without a data ring */
+			esz = rte_ub_ring_get_data_elt_size(h, c);
+			if (esz == 0 || esz < need)
+				continue;
+			buf = rte_ub_ring_alloc_buf(h, c);
+			if (buf) { pi = c; break; }
+		}
+	}
+	if (!buf) return NULL;
+
+	/* encode chain first (recursive): the child comes back as its
+	 * FINAL packed {pi, offset} element — exactly the bit pattern the
+	 * shm header's next field must carry, so no re-pack here */
+	void *child = NULL;
+	if (m->next) {
+		child = enc(m->next, pi, elt_size, h);
+		if (!child) { rte_ub_ring_free_buf(h, buf); return NULL; }
+	}
+
+	/*
+	 * Optimisation: mutate the LOCAL mbuf's next/pool/buf_len,
+	 * memcpy once, then restore. Avoids separate slow writes to
+	 * shared memory.
+	 */
+	struct rte_mbuf *save_next = m->next;
+	struct rte_mempool *save_pool = m->pool;
+	uint16_t save_buf_len = m->buf_len;
+
+	if (child) {
+		/* pack the child pointer as {pi, element-base offset} so
+		 * dec() can rebuild it. off > 0 always: element 0 is
+		 * reserved, so a packed 0 would be ambiguous with the
+		 * NULL terminator */
+		m->next = (struct rte_mbuf *)child;
+	} else {
+		/* 0 = no next segment (element 0 reserved, so no clash) */
+		m->next = NULL;
+	}
+	m->pool = NULL;
+	m->buf_len = m->data_off + m->data_len; /* no tailroom in shm */
+
+#ifdef UB_RING_ETH_NO_COPY
+	/* DEBUG: copy removed to measure its cost — the shm buffer stays
+	 * zeroed, so the peer sees pkt_len = 0 (0 Mbps). refcnt = 1 is
+	 * written so rte_pktmbuf_prefree_seg() takes its return-m path
+	 * (a zero refcnt decrements to 65535 and the mbuf is never put
+	 * back); next stays 0, which now IS the NULL terminator */
+	((struct rte_mbuf *)buf)->refcnt = 1;
+#else
+	enc_copy64(buf, m, need);
+#endif
+
+	m->next = save_next;
+	m->pool = save_pool;
+	m->buf_len = save_buf_len;
+	/* return the FINAL ring element {pi, offset} — the same 8B
+	 * encoding every ring carries, so the send path enqueues it
+	 * as-is with no second encoding */
+	return ub_ring_elem_pack((uint8_t)pi,
+		ub_ring_buf_off(rte_ub_ring_get_data_buf_area(h, pi), buf));
+}
+
+/* free an ENCODED buffer chain: head elem = packed {pi, off}; the
+ * remaining links live in each shm segment's header next field
+ * (packed {pi, off} or 0). Every segment goes back to the SENDER's
+ * per-lcore alloc cache (not the data ring) — a failed burst's
+ * buffers are reused by the next alloc_buf on this lcore. */
+static void
+free_enc_chain(struct rte_ub_ring_handle *h, void *elem)
+{
+	while (elem) {
+		uint8_t ni = (uint8_t)((uintptr_t)elem >> 56);
+		uint64_t off = (uintptr_t)elem & 0x00FFFFFFFFFFFFFFULL;
+		void *buf = ub_ring_buf_ptr(
+			rte_ub_ring_get_data_buf_area(h, ni), off);
+		struct rte_mbuf *m = buf;
+		uint64_t nv = (uint64_t)(uintptr_t)m->next;
+		rte_ub_ring_free_elem_cached(h, elem);
+		elem = nv ? ub_ring_elem_pack((uint8_t)(nv >> 56),
+				nv & 0x00FFFFFFFFFFFFFFULL) : NULL;
+	}
+}
+
+static struct rte_mbuf *dec(void *elem, struct rte_mempool *dp, struct rte_ub_ring_handle *h, int depth)
+{
+	/* decode the ring element: packed {pi, offset} -> data-area pointer.
+	 * enc() produced this encoding; every ring (tx/rx/shadow/return)
+	 * only ever carries the 8B value, so decoding lives here and here
+	 * alone — symmetric with enc() */
+	uint8_t ni = ub_ring_elem_get_node(elem);
+	uint64_t off = ub_ring_elem_get_offset(elem);
+	void *buf = ub_ring_buf_ptr(rte_ub_ring_get_data_buf_area(h, ni), off);
+	struct rte_mbuf *m = buf;
+	uint64_t nv = (uint64_t)(uintptr_t)m->next;
+
+	if (depth > 8) {
+		UB_RING_ETH_LOG(ERR, "decode depth exceeded: buf=%p depth=%d next=0x%" PRIx64,
+				buf, depth, nv);
+		m->next = NULL;
+		return m;
+	}
+
+	m->buf_addr = (char *)m + sizeof(struct rte_mbuf) + m->priv_size; m->pool = dp;
+	if (nv) { /* 0 = no next segment (element 0 reserved, no clash) */
+		uint8_t cni = (uint8_t)(nv >> 56); uint64_t coff = nv & 0x00FFFFFFFFFFFFFFULL;
+		void *nb = ub_ring_buf_ptr(rte_ub_ring_get_data_buf_area(h, cni), coff);
+		if (nb == buf) {
+			UB_RING_ETH_LOG(ERR, "self-referencing next: buf=%p ni=%u off=0x%" PRIx64,
+					buf, cni, coff);
+			m->next = NULL;
+			return m;
+		}
+		m->next = dec(nb, dp, h, depth + 1);
+	} else m->next = NULL;
+	return m;
+}
+
+static uint32_t drn(struct rte_mempool *d, struct rte_ub_ring_handle *h)
+{
+	if (!d) return 0;
+	void *o[512];
+	uint32_t got = 0;
+	/* fixed-size all-or-nothing batches, no dependence on the pool
+	 * internals: freed mbufs sit in the workers' per-lcore caches
+	 * until they overflow into the ring; bypass the cache here
+	 * (get_bulk would strand up to cache_size objects in this
+	 * lcore's cache). A partial tail below one batch stays in the
+	 * ring and is picked up once the next flush tops it up — the
+	 * drain lcore loops this anyway */
+	for (;;) {
+		/* mempool ops contract: 0 = got n objects, <0 = empty */
+		if (rte_mempool_ops_dequeue_bulk(d, o, 512) < 0)
+			break;
+		/* one bulk SP enqueue per drain pass instead of one CAS
+		 * per buffer (workers would serialize on the return ring) */
+		rte_ub_ring_return_burst(h, o, 512);
+		got += 512;
+		UB_RING_ETH_FLOW_N("drn", 512);
+	}
+	return got;
+}
+
+static struct rte_mempool *mkp(struct rte_ub_ring_handle *h)
+{ /* MPSC: put side is MP (each worker's cache overflow flushes into the
+   * ring), get side is SC (only the dedicated drain lcore — so the
+   * ring backend dequeue is lock-free). cache_size=256 batches the
+   * workers' frees so the hot pktmbuf_free path never takes the ring's
+   * MP enqueue lock.
+   * depth = 2x the aggregate data-ring depth: more than every
+   * in-flight buffer can be freed at once, with headroom for drain
+   * lcore scheduling lag */
+	uint32_t total = rte_ub_ring_get_total_bufs(h);
+	uint64_t cap = 2ull * total;
+	if (cap > UINT32_MAX) cap = UINT32_MAX;
+	UB_RING_ETH_LOG(INFO, "mkp: total data bufs=%u, pool cap=%llu",
+		total, (unsigned long long)cap);
+	if (total == 0) {
+		UB_RING_ETH_LOG(ERR, "mkp: no provider data rings ready — "
+			"cannot size dummy pool (2x data ring); dec() would restore "
+			"a NULL pool and pktmbuf_free would crash");
+		return NULL;
+	}
+	struct rte_mempool *mp=rte_mempool_create("ub_eth_dummy",(unsigned)cap,0,256,0,NULL,NULL,NULL,NULL,rte_socket_id(),MEMPOOL_F_SC_GET);
+	if (!mp) {
+		UB_RING_ETH_LOG(ERR, "mkp: rte_mempool_create(cap=%llu) failed "
+			"rte_errno=%d (%s)", (unsigned long long)cap,
+			rte_errno, rte_strerror(rte_errno));
+		return NULL;
+	}
+	{
+		unsigned int avail = rte_mempool_avail_count(mp);
+		if (avail != (unsigned int)cap)
+			UB_RING_ETH_LOG(ERR, "mkp: pool created but populated "
+				"partially: avail=%u cap=%llu", avail,
+				(unsigned long long)cap);
+		/* drain all placeholder objects so only freed mbufs are
+		 * ever retrieved. Dequeue straight from the ring (get_bulk
+		 * would refill this lcore's cache with placeholders):
+		 * fixed-size batches, then one-by-one for the tail.
+		 * mempool ops contract: 0 = got n objects, <0 = empty */
+		void *o[64];
+		uint32_t drained = 0;
+		for (;;) {
+			if (rte_mempool_ops_dequeue_bulk(mp, o, 64) < 0)
+				break;
+			drained += 64;
+		}
+		for (;;) {
+			if (rte_mempool_ops_dequeue_bulk(mp, o, 1) < 0)
+				break;
+			drained++;
+		}
+		if (drained != (uint32_t)cap)
+			UB_RING_ETH_LOG(ERR, "mkp: drain incomplete: drained=%u "
+				"cap=%llu", drained, (unsigned long long)cap);
+		UB_RING_ETH_LOG(INFO, "mkp: dummy pool ready (cap=%llu "
+			"drained=%u avail=%u)", (unsigned long long)cap,
+			drained, rte_mempool_avail_count(mp));
+	}
+	return mp; }
+
+static uint16_t eth_rx(void *q, struct rte_mbuf **b, uint16_t nb) {
+	struct ub_ring_eth_queue *rq=q; struct ub_ring_eth_internals *in=rq->internals;
+	struct rte_ub_ring_handle *h=in->ub_ring_h;
+	/* freed mbufs are drained back to the providers by the app's own
+	 * lcore calling rte_eth_ub_ring_drain() — not on the RX path */
+	void *raw[UB_RING_ETH_MAX_BURST];
+	uint16_t n=rte_ub_ring_is_mpmc_enabled(h)?rte_ub_ring_mc_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST)):rte_ub_ring_recv_burst(h,rq->queue_id,raw,RTE_MIN(nb,UB_RING_ETH_MAX_BURST));
+	/* raw[] carries PACKED {pi, offset} elements — dec() decodes them.
+	 * Prefetch the NEXT element's data lines while decoding the current
+	 * one: the header lines are cold (the peer's remote write
+	 * invalidated them last round trip), so one-element look-ahead
+	 * hides the refill latency */
+	for(uint16_t i=0;i<n;i++){
+		if (i + 1 < n) {
+			void *nbuf = ub_ring_buf_ptr(
+				rte_ub_ring_get_data_buf_area(h, ub_ring_elem_get_node(raw[i + 1])),
+				ub_ring_elem_get_offset(raw[i + 1]));
+			rte_prefetch0(nbuf);
+			rte_prefetch0((char *)nbuf + 64);
+		}
+		b[i]=dec(raw[i],in->dummy_pool,h,0);
+	}
+	return n; }
+
+static uint16_t eth_tx(void *q, struct rte_mbuf **m, uint16_t nb) {
+	struct ub_ring_eth_queue *rq=q; struct ub_ring_eth_internals *in=rq->internals;
+	struct rte_ub_ring_handle *h=in->ub_ring_h;
+	/* enc() produces the FINAL packed {pi, offset} ring elements —
+	 * the send path enqueues them as-is, no second encoding */
+	void *elems[nb]; uint16_t c=0;
+	for(uint16_t i=0;i<nb;i++){
+		void *e=enc(m[i],rq->provider_index,rq->elt_size,h);
+		if(!e)break;
+		elems[c++]=e;
+	}
+	if(!c){
+		UB_RING_ETH_LOSS_ADD("eth_tx_enc", nb, "no free buffer anywhere");
+		return 0;
+	}
+	/*
+	 * Ownership model:
+	 *  - sent buffers: ownership transferred to peer; peer returns
+	 *    them via pktmbuf_free → drain → return ring → collect.
+	 *  - unsent buffers (s < c): ownership still local, return to
+	 *    local data ring. fail-fast send makes s ∈ {0, c}.
+	 */
+	uint16_t s = rte_ub_ring_is_mpmc_enabled(h)
+		? rte_ub_ring_mp_send_burst(h, rq->queue_id, elems, c)
+		: rte_ub_ring_send_burst(h, rq->queue_id, elems, c);
+	if (s < c)
+		UB_RING_ETH_LOSS_ADD("eth_tx", c - s, "send backpressure (freed to data ring)");
+	for (uint16_t i = s; i < c; i++)
+		free_enc_chain(h, elems[i]);
+	if (s)
+		UB_RING_ETH_FLOW_N("eth_tx", s);
+	return s; }
+
+static int eth_cfg(struct rte_eth_dev*d __rte_unused){return 0;}
+static int eth_start(struct rte_eth_dev*d){d->data->dev_link.link_status=RTE_ETH_LINK_UP;return 0;}
+static int eth_stop(struct rte_eth_dev*d){d->data->dev_started=0;d->data->dev_link.link_status=RTE_ETH_LINK_DOWN;return 0;}
+static int eth_close(struct rte_eth_dev*d){struct ub_ring_eth_internals*in=d->data->dev_private;eth_stop(d);if(in->dummy_pool){drn(in->dummy_pool,in->ub_ring_h);rte_mempool_free(in->dummy_pool);}d->data->mac_addrs=NULL;rte_free(in);d->data->dev_private=NULL;return 0;}
+static int eth_info(struct rte_eth_dev*d,struct rte_eth_dev_info*i){struct ub_ring_eth_internals*in=d->data->dev_private;uint32_t t=rte_ub_ring_get_total_queues(in->ub_ring_h);i->max_mac_addrs=1;i->max_rx_pktlen=(uint32_t)-1;i->max_rx_queues=(uint16_t)t;i->max_tx_queues=(uint16_t)t;i->min_rx_bufsize=0;i->rx_offload_capa=RTE_ETH_RX_OFFLOAD_SCATTER;i->tx_offload_capa=RTE_ETH_TX_OFFLOAD_MULTI_SEGS;return 0;}
+static int eth_rxq(struct rte_eth_dev*d,uint16_t q,uint16_t nb __rte_unused,unsigned int s __rte_unused,const struct rte_eth_rxconf*c __rte_unused,struct rte_mempool*p __rte_unused){struct ub_ring_eth_internals*in=d->data->dev_private;uint32_t t=rte_ub_ring_get_total_queues(in->ub_ring_h);if(q>=t)return -EINVAL;in->rx_queues[q].queue_id=q;in->rx_queues[q].provider_index=rte_ub_ring_queue_to_provider(in->ub_ring_h,q);in->rx_queues[q].internals=in;d->data->rx_queues[q]=&in->rx_queues[q];return 0;}
+static int eth_txq(struct rte_eth_dev*d,uint16_t q,uint16_t nb __rte_unused,unsigned int s __rte_unused,const struct rte_eth_txconf*c __rte_unused){struct ub_ring_eth_internals*in=d->data->dev_private;uint32_t t=rte_ub_ring_get_total_queues(in->ub_ring_h);if(q>=t)return -EINVAL;in->tx_queues[q].queue_id=q;in->tx_queues[q].provider_index=rte_ub_ring_queue_to_provider(in->ub_ring_h,q);in->tx_queues[q].elt_size=rte_ub_ring_get_data_elt_size(in->ub_ring_h,in->tx_queues[q].provider_index);in->tx_queues[q].internals=in;d->data->tx_queues[q]=&in->tx_queues[q];return 0;}
+static int eth_link(struct rte_eth_dev*d __rte_unused,int w __rte_unused){return 0;}
+static int eth_stats(struct rte_eth_dev*d,struct rte_eth_stats*s){(void)d;memset(s,0,sizeof(*s));return 0;}
+static int eth_sreset(struct rte_eth_dev*d){(void)d;return 0;}
+static int eth_ok(struct rte_eth_dev*d __rte_unused){return 0;}
+static int eth_ma(struct rte_eth_dev*d __rte_unused,struct rte_ether_addr*a __rte_unused,uint32_t i __rte_unused,uint32_t p __rte_unused){return 0;}
+static void eth_mr(struct rte_eth_dev*d __rte_unused,uint32_t i __rte_unused){}
+static int eth_ld(struct rte_eth_dev*d){d->data->dev_link.link_status=RTE_ETH_LINK_DOWN;return 0;}
+static int eth_lu(struct rte_eth_dev*d){d->data->dev_link.link_status=RTE_ETH_LINK_UP;return 0;}
+
+static const struct eth_dev_ops eth_ops={
+	.dev_configure=eth_cfg,.dev_start=eth_start,.dev_stop=eth_stop,.dev_close=eth_close,
+	.dev_infos_get=eth_info,.rx_queue_setup=eth_rxq,.tx_queue_setup=eth_txq,
+	.link_update=eth_link,.stats_get=eth_stats,.stats_reset=eth_sreset,
+	.mac_addr_add=eth_ma,.mac_addr_remove=eth_mr,
+	.promiscuous_enable=eth_ok,.promiscuous_disable=eth_ok,
+	.allmulticast_enable=eth_ok,.allmulticast_disable=eth_ok,
+	.dev_set_link_up=eth_lu,.dev_set_link_down=eth_ld,
+};
+
+static int parse_addr(const char *k __rte_unused, const char *v, void *extra)
+{ *(void **)extra = (void *)(uintptr_t)strtoull(v, NULL, 0); return 0; }
+
+static int
+vdev_probe(struct rte_vdev_device *vdev)
+{
+	struct rte_kvargs *kv = rte_kvargs_parse(rte_vdev_device_args(vdev), NULL);
+	void *hp = NULL;
+	if (kv) { rte_kvargs_process(kv, "addr", parse_addr, &hp); rte_kvargs_free(kv); }
+	if (!hp) return -EINVAL;
+
+	const char *dn = rte_vdev_device_name(vdev);
+
+	struct rte_ub_ring_handle *h = hp;
+	uint32_t nq = rte_ub_ring_get_total_queues(h);
+	struct ub_ring_eth_internals *in = rte_zmalloc_socket(NULL, sizeof(*in), 0, rte_socket_id());
+	if (!in) return -ENOMEM; in->ub_ring_h = h; in->dummy_pool = mkp(h);
+	if (!in->dummy_pool) {
+		UB_RING_ETH_LOG(ERR, "vdev_probe: dummy pool creation failed "
+			"(see mkp log above) — aborting probe; the data path "
+			"cannot run with a NULL pool (dec() would restore a NULL "
+			"m->pool and pktmbuf_free would crash)");
+		rte_free(in);
+		return -ENOMEM;
+	}
+
+	void **rxq = rte_calloc_socket(NULL, nq, sizeof(void *), 0, rte_socket_id());
+	void **txq = rte_calloc_socket(NULL, nq, sizeof(void *), 0, rte_socket_id());
+	if (!rxq || !txq) { rte_free(rxq); rte_free(txq); rte_free(in); return -ENOMEM; }
+	for (uint32_t i = 0; i < nq; i++) {
+		in->rx_queues[i].queue_id = i;
+		in->rx_queues[i].provider_index = rte_ub_ring_queue_to_provider(h, i);
+		in->rx_queues[i].elt_size = rte_ub_ring_get_data_elt_size(h, in->rx_queues[i].provider_index);
+		in->rx_queues[i].internals = in;
+		in->tx_queues[i].queue_id = i;
+		in->tx_queues[i].provider_index = rte_ub_ring_queue_to_provider(h, i);
+		in->tx_queues[i].elt_size = rte_ub_ring_get_data_elt_size(h, in->tx_queues[i].provider_index);
+		in->tx_queues[i].internals = in;
+	}
+	struct rte_eth_dev *ed = rte_eth_dev_allocate(dn);
+	if (!ed) { rte_free(rxq); rte_free(txq); rte_free(in); return -ENODEV; }
+	ed->data->rx_queues = rxq; ed->data->tx_queues = txq;
+	ed->data->nb_rx_queues = (uint16_t)nq; ed->data->nb_tx_queues = (uint16_t)nq;
+	ed->data->dev_private = in; ed->data->numa_node = rte_socket_id();
+	ed->data->promiscuous = 1; ed->data->all_multicast = 1;
+	ed->data->dev_flags |= RTE_ETH_DEV_AUTOFILL_QUEUE_XSTATS;
+	for (uint32_t i = 0; i < nq; i++) {
+		ed->data->rx_queues[i] = &in->rx_queues[i];
+		ed->data->tx_queues[i] = &in->tx_queues[i];
+	}
+	in->address = (struct rte_ether_addr){ .addr_bytes = {0x02} };
+	ed->data->mac_addrs = &in->address;
+	ed->data->dev_link = (struct rte_eth_link){
+		.link_speed = RTE_ETH_SPEED_NUM_10G, .link_duplex = RTE_ETH_LINK_FULL_DUPLEX,
+		.link_status = RTE_ETH_LINK_DOWN, .link_autoneg = RTE_ETH_LINK_FIXED,
+	};
+	ed->device = &vdev->device;
+	ed->dev_ops = &eth_ops;
+	ed->rx_pkt_burst = eth_rx;
+	ed->tx_pkt_burst = eth_tx;
+	rte_eth_dev_probing_finish(ed);
+	return 0;
+}
+
+static int vdev_remove(struct rte_vdev_device *vdev)
+{
+	const char *n = rte_vdev_device_name(vdev);
+	struct rte_eth_dev *ed = rte_eth_dev_allocated(n);
+	if (!ed) return 0;
+	eth_close(ed);
+	rte_eth_dev_release_port(ed);
+	return 0;
+}
+
+static struct rte_vdev_driver vdrv = { .probe = vdev_probe, .remove = vdev_remove };
+RTE_PMD_REGISTER_VDEV(net_ub_ring, vdrv);
+
+int
+rte_eth_ub_ring_attach(const char *name, struct rte_ub_ring_handle *h)
+{
+	char vname[64], args[32];
+	int ret;
+
+	ret = snprintf(vname, sizeof(vname), "net_ub_ring_%s", name);
+	if (ret >= (int)sizeof(vname)) { rte_errno = ENAMETOOLONG; return -1; }
+
+	snprintf(args, sizeof(args), "addr=%p", (void *)h);
+
+	ret = rte_vdev_init(vname, args);
+	if (ret) return -1;
+
+	uint16_t pid;
+	ret = rte_eth_dev_get_port_by_name(vname, &pid);
+	return ret ? -1 : (int)pid;
+}
+
+unsigned int
+rte_eth_ub_ring_drain(int port_id)
+{
+	if (port_id < 0 || port_id >= RTE_MAX_ETHPORTS)
+		return 0;
+	struct rte_eth_dev *d = &rte_eth_devices[port_id];
+	if (!d->data || !d->data->dev_private)
+		return 0;
+	struct ub_ring_eth_internals *in = d->data->dev_private;
+	return drn(in->dummy_pool, in->ub_ring_h);
+}
